@@ -61,6 +61,20 @@ async fn serve(reply: Reply) -> (String, JoinHandle<String>) {
     (url, server)
 }
 
+// A `wss://` connect builds its client config inside rustls, which panics when the
+// dependency graph carries no crypto provider, so this pins the provider the manifest selects.
+#[test]
+fn a_tls_client_config_builds_without_a_provider_panic() {
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+
+    assert_eq!(
+        config.crypto_provider().cipher_suites.len(),
+        rustls::crypto::ring::default_provider().cipher_suites.len()
+    );
+}
+
 #[tokio::test]
 async fn an_ok_answer_is_success_and_the_frame_is_pinned() {
     let (url, server) = serve(Reply::Text(r#"{"ok":true,"output":"the answer"}"#)).await;
