@@ -674,6 +674,8 @@ version = "2026.11.1"
 dependencies = [
  "axum",
  "env_logger",
+ "hex",
+ "hmac",
  "kuroko-core",
  "kuroko-engine",
  "kuroko-linear",
@@ -681,6 +683,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml",
  "tower",
