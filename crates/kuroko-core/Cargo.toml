@@ -1,11 +1,15 @@
 [package]
-name = "removeme"
+name = "kuroko-core"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+
+[dev-dependencies]
 proptest.workspace = true
+stateright.workspace = true
 
 [lints]
 workspace = true

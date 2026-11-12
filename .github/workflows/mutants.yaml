@@ -4,7 +4,13 @@
 # changed lines that are not already recorded, and main tests everything not
 # already recorded. The first run on main is therefore the only full one; delete
 # the branch's cache entries to force another. A test weakened after its mutant
-# was recorded as caught stays undetected until then.
+# was recorded as caught stays undetected until then. Only `crates/` is gated;
+# `apps/` is untestable I/O wiring and stays exempt.
+#
+# `--timeout 120` overrides the auto timeout of 10x baseline test time. Under
+# eight jobs on a shared runner, a mutant whose killing test waits out a bound
+# or shrinks a proptest case can run past 20s while still being killed, and
+# cargo-mutants counts a timeout as a gate failure.
 name: mutants
 on:
   pull_request:
@@ -50,8 +56,11 @@ jobs:
           DIFF: ${{ github.event_name == 'pull_request' && format('{0}/changed.diff', runner.temp) || '' }}
         run: |
           nix develop --command cargo mutants \
+            --workspace \
+            --exclude 'apps/**' \
             --jobs 8 \
             --iterate \
+            --timeout 120 \
             ${DIFF:+--in-diff "$DIFF"}
       - uses: actions/cache/save@v6.1.0
         # An empty diff, a diff without Rust files, or a diff that matches no

@@ -51,6 +51,32 @@
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="clang"
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="clang"
           '';
+
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: _type:
+              let
+                name = baseNameOf path;
+              in
+              !(builtins.elem name [
+                ".direnv"
+                "target"
+              ])
+              && !(pkgs.lib.hasPrefix "result" name);
+          };
+          cargoCommonArgs = {
+            inherit src;
+            strictDeps = true;
+          };
+          cargoArtifacts = craneLib.buildDepsOnly cargoCommonArgs;
+          kuroko = craneLib.buildPackage (
+            cargoCommonArgs
+            // {
+              inherit cargoArtifacts;
+              meta.mainProgram = "kuroko";
+            }
+          );
         in
         {
           _module.args = {
@@ -60,50 +86,40 @@
             };
           };
 
-          checks =
-            let
-              src = pkgs.lib.cleanSourceWith {
-                src = ./.;
-                filter =
-                  path: _type:
-                  let
-                    name = baseNameOf path;
-                  in
-                  !(builtins.elem name [
-                    ".direnv"
-                    "target"
-                  ])
-                  && !(pkgs.lib.hasPrefix "result" name);
-              };
-              cargoCommonArgs = {
-                inherit src;
-                strictDeps = true;
-              };
-              cargoArtifacts = craneLib.buildDepsOnly cargoCommonArgs;
-            in
-            {
-              clippy = craneLib.cargoClippy (
-                cargoCommonArgs
-                // {
-                  inherit cargoArtifacts;
-                  cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-                }
-              );
-              doctest = craneLib.cargoDocTest (
-                cargoCommonArgs
-                // {
-                  inherit cargoArtifacts;
-                }
-              );
-              test = craneLib.cargoNextest (
-                cargoCommonArgs
-                // {
-                  inherit cargoArtifacts;
-                  cargoExtraArgs = "--locked";
-                  cargoNextestExtraArgs = "--no-tests=pass --no-fail-fast --test-threads $NIX_BUILD_CORES";
-                }
-              );
-            };
+          checks = {
+            clippy = craneLib.cargoClippy (
+              cargoCommonArgs
+              // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+              }
+            );
+            fmt = craneLib.cargoFmt cargoCommonArgs;
+            doctest = craneLib.cargoDocTest (
+              cargoCommonArgs
+              // {
+                inherit cargoArtifacts;
+              }
+            );
+            test = craneLib.cargoNextest (
+              cargoCommonArgs
+              // {
+                inherit cargoArtifacts;
+                cargoExtraArgs = "--locked";
+                cargoNextestExtraArgs = "--no-tests=pass --no-fail-fast --test-threads $NIX_BUILD_CORES";
+              }
+            );
+          };
+
+          packages = {
+            default = kuroko;
+            inherit kuroko;
+          };
+
+          apps.kuroko = {
+            type = "app";
+            program = "${kuroko}/bin/kuroko";
+          };
 
           devShells.default = pkgs.mkShellNoCC {
             inputsFrom = [ config.pre-commit.devShell ];

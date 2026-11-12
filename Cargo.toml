@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/removeme"]
+members = [
+    "apps/kuroko",
+    "crates/kuroko-core",
+    "crates/kuroko-engine",
+    "crates/kuroko-linear",
+    "crates/kuroko-transport",
+]
 resolver = "3"
 
 [workspace.dependencies]
