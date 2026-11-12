@@ -89,6 +89,7 @@
                   cargoClippyExtraArgs = "--all-targets -- --deny warnings";
                 }
               );
+              fmt = craneLib.cargoFmt cargoCommonArgs;
               doctest = craneLib.cargoDocTest (
                 cargoCommonArgs
                 // {
