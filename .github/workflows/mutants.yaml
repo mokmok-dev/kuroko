@@ -4,7 +4,8 @@
 # changed lines that are not already recorded, and main tests everything not
 # already recorded. The first run on main is therefore the only full one; delete
 # the branch's cache entries to force another. A test weakened after its mutant
-# was recorded as caught stays undetected until then.
+# was recorded as caught stays undetected until then. Only `crates/` is gated;
+# `apps/` is untestable I/O wiring and stays exempt.
 name: mutants
 on:
   pull_request:
@@ -50,6 +51,8 @@ jobs:
           DIFF: ${{ github.event_name == 'pull_request' && format('{0}/changed.diff', runner.temp) || '' }}
         run: |
           nix develop --command cargo mutants \
+            --workspace \
+            --exclude 'apps/**' \
             --jobs 8 \
             --iterate \
             ${DIFF:+--in-diff "$DIFF"}

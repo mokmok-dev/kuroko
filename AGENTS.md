@@ -8,7 +8,7 @@ Run everything through the flake. direnv loads the devshell in interactive shell
 
 - `nix flake check` is the full gate. It runs clippy `--all-targets -- --deny warnings`, doctest, nextest, treefmt, and pre-commit with deadnix and statix.
 - `nix develop --command cargo nextest run` runs the tests locally.
-- `nix develop --command cargo mutants --jobs 2 --iterate` runs the mutation gate. Everything under `crates/` must be 100% killed. `apps/` is exempt. CI runs the same gate in `mutants.yaml`, because a full mutation run takes far longer than every other check together.
+- `nix develop --command cargo mutants --workspace --exclude 'apps/**' --jobs 2 --iterate` runs the mutation gate. Everything under `crates/` must be 100% killed. `apps/` is exempt. CI runs the same gate in `mutants.yaml`, because a full mutation run takes far longer than every other check together.
 
 The flake source contains only committed files. A new file that is not committed is invisible to `nix flake check`, so commit before trusting a check that should see new files.
 
