@@ -352,6 +352,47 @@ async fn shutdown_joins_only_after_the_in_flight_dispatch_finishes() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_queued_task_stays_unstarted_after_stop() {
+    let (gate, gate_rx) = watch::channel(false);
+    let (transport, mut starts) = Gated::new(gate_rx);
+    let (engine, handle) = spawn(
+        transport.clone(),
+        limits(1, 4),
+        Arc::new(FixedClock(Millis(10))),
+    );
+
+    assert_eq!(
+        engine
+            .submit(request(key("issue-a", "kuroko"), "MOK-1", "a"))
+            .await,
+        Ok(Submission::Accepted)
+    );
+    assert_eq!(next_start(&mut starts).await, key("issue-a", "kuroko"));
+    assert_eq!(
+        engine
+            .submit(request(key("issue-b", "kuroko"), "MOK-2", "b"))
+            .await,
+        Ok(Submission::Accepted)
+    );
+
+    drop(engine);
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!handle.is_finished());
+
+    gate.send(true).unwrap();
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(transport.completed.load(Ordering::SeqCst));
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+    assert!(starts.try_recv().is_err());
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_submit_after_drop_returns_engine_down() {
     let (gate, gate_rx) = watch::channel(false);
     let (transport, _starts) = Gated::new(gate_rx);

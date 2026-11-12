@@ -135,7 +135,9 @@ async fn run(
     let mut open = true;
 
     loop {
-        if !accepting && book.in_flight() == 0 {
+        // The book is frozen once accepting stops, so the spawned set is the
+        // only count of work that still has to be joined.
+        if !accepting && dispatches.is_empty() {
             break;
         }
         tokio::select! {
@@ -159,7 +161,8 @@ async fn run(
                         owners.remove(&id);
                     }
                     Err(error) => {
-                        if let Some(key) = owners.remove(&error.id()) {
+                        let settled = owners.remove(&error.id()).filter(|_| accepting);
+                        if let Some(key) = settled {
                             let done = Done {
                                 at: clock.now_ms(),
                                 outcome: Outcome::Failure(FailureReason::Panicked),
@@ -179,6 +182,10 @@ async fn run(
                 }
             }
             Some(event) = finished.recv() => {
+                // Applying a finish after stop would let `drain` start queued work.
+                if !accepting {
+                    continue;
+                }
                 if let Event::Finished { key, mut done } = event {
                     done.at = clock.now_ms();
                     let _ = apply_step(
