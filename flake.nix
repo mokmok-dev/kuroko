@@ -109,6 +109,7 @@
             inputsFrom = [ config.pre-commit.devShell ];
 
             packages = with pkgs; [
+              cargo-mutants
               cargo-nextest
               linkerPackages
               rustToolchain

@@ -3,3 +3,5 @@
 /result
 /result-*
 /target
+mutants.out
+mutants.out.old
