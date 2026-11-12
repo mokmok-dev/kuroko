@@ -8,5 +8,8 @@ version.workspace = true
 kuroko-core = { version = "2026.11.1", path = "../kuroko-core" }
 tokio = { version = "1.54.1", features = ["rt", "macros", "sync", "time"] }
 
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["test-util"] }
+
 [lints]
 workspace = true

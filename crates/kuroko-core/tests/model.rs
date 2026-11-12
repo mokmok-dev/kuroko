@@ -118,6 +118,12 @@ impl Model for Kuroko {
             let Cmd::Dispatch(dispatch) = cmd;
             *next.tickets.entry(dispatch.key).or_insert(0) += 1;
         }
+        // Two `withdraw` mutants let a finished task be removed and re-admitted forever,
+        // so the ticket map grows without bound and BFS never terminates. A ticket of 2
+        // is still reachable, so an invariant violation still fails fast under this bound.
+        if next.tickets.values().any(|&tickets| tickets > 4) {
+            return None;
+        }
         Some(next)
     }
 
@@ -169,6 +175,17 @@ impl Model for Kuroko {
                         !task.state.is_terminal()
                             || matches!(task.state, TaskState::Succeeded(_) | TaskState::Failed(_))
                     })
+                },
+            ),
+            Property::always(
+                "in flight matches the dispatched count",
+                |_model: &Self, state: &SysState| {
+                    state.book.in_flight()
+                        == state
+                            .book
+                            .tasks()
+                            .filter(|task| matches!(task.state, TaskState::Dispatched))
+                            .count()
                 },
             ),
         ]
