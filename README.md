@@ -47,6 +47,43 @@ reason. `[server] bind` defaults to `127.0.0.1:8787`, `[linear] replay_window_se
 store is opened and loaded before the HTTP listener binds, so a database that cannot be opened
 stops the daemon instead of accepting deliveries it cannot persist.
 
+## NixOS
+
+The flake exports `nixosModules.default`, which renders the config and runs the daemon as a
+systemd service:
+
+```nix
+{
+  inputs.kuroko.url = "github:mokmok-dev/kuroko";
+
+  imports = [ inputs.kuroko.nixosModules.default ];
+
+  services.kuroko = {
+    enable = true;
+    environmentFile = "/run/secrets/kuroko.env";
+    settings = {
+      transport.stdio = {
+        command = "claude";
+        args = [ "-p" ];
+      };
+      trigger.label_names = [ "agent" ];
+    };
+  };
+}
+```
+
+The module writes `/etc/kuroko/config.toml` from `services.kuroko.settings`, starts
+`kuroko --config /etc/kuroko/config.toml` as the `kuroko` system user, and keeps the database in
+`/var/lib/kuroko`. `[store] path` defaults to `/var/lib/kuroko/kuroko.db` and `[server] bind` to
+`127.0.0.1:8787`. `workingDirectory` defaults to the state directory and is inherited by a stdio
+agent, so set it to the workspace the agent should edit. `stopTimeout` defaults to 3900 seconds,
+which leaves a finishing agent 300 seconds past its 3600-second timeout before systemd kills the
+unit.
+
+Put `KUROKO_LINEAR_SECRET=whsec_...` in the file named by `environmentFile`, readable only by
+root. Setting `settings.linear.secret` instead puts the secret in the world-readable Nix store,
+and the module warns about it.
+
 ## Point Linear at it
 
 Create a webhook in Linear settings with the URL `http://your-host:8787/webhooks/linear` and pick

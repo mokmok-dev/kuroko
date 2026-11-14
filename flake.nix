@@ -14,6 +14,7 @@
 
   outputs =
     {
+      self,
       nixpkgs,
       flake-parts,
       git-hooks,
@@ -22,11 +23,25 @@
       crane,
       ...
     }@inputs:
+    let
+      kurokoModule =
+        {
+          lib,
+          pkgs,
+          ...
+        }:
+        {
+          imports = [ ./nix/module.nix ];
+          services.kuroko.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.kuroko;
+        };
+    in
     flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [
         git-hooks.flakeModule
         treefmt-nix.flakeModule
       ];
+
+      flake.nixosModules.default = kurokoModule;
 
       perSystem =
         {
@@ -109,6 +124,77 @@
                 cargoNextestExtraArgs = "--no-tests=pass --no-fail-fast --test-threads $NIX_BUILD_CORES";
               }
             );
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            kuroko-module =
+              let
+                nixosSystem = nixpkgs.lib.nixosSystem;
+
+                # A stub package keeps the check from pulling the crate build into
+                # its closure; the default package is asserted separately.
+                stub = nixosSystem {
+                  inherit system;
+                  modules = [
+                    kurokoModule
+                    {
+                      system.stateVersion = "24.11";
+                      services.kuroko = {
+                        enable = true;
+                        package = pkgs.writeShellScriptBin "kuroko" "exec true";
+                        environmentFile = "/run/secrets/kuroko.env";
+                        settings = {
+                          transport.stdio = {
+                            command = "cat";
+                            args = [ "-" ];
+                          };
+                          trigger.label_names = [ "agent" ];
+                        };
+                      };
+                    }
+                  ];
+                };
+
+                defaultPackage =
+                  (nixosSystem {
+                    inherit system;
+                    modules = [
+                      kurokoModule
+                      {
+                        system.stateVersion = "24.11";
+                        services.kuroko = {
+                          enable = true;
+                          settings = {
+                            linear.secret = "whsec_test";
+                            transport.websocket.url = "wss://agent.example/ws";
+                          };
+                        };
+                      }
+                    ];
+                  }).config.services.kuroko.package;
+
+                unit = stub.config.systemd.units."kuroko.service".text;
+                generated = stub.config.environment.etc."kuroko/config.toml".source;
+                unitFile = pkgs.writeText "kuroko.service" unit;
+              in
+              assert defaultPackage.meta.mainProgram == "kuroko";
+              pkgs.runCommand "kuroko-module-check" { } ''
+                grep -q -- '--config /etc/kuroko/config.toml' ${unitFile}
+                grep -q -- 'User=kuroko' ${unitFile}
+                grep -q -- 'StateDirectory=kuroko' ${unitFile}
+                grep -q -- 'StateDirectoryMode=0700' ${unitFile}
+                grep -q -- 'EnvironmentFile=/run/secrets/kuroko.env' ${unitFile}
+                grep -q -- 'RUST_LOG=info' ${unitFile}
+                grep -q -- 'KillMode=mixed' ${unitFile}
+                grep -q -- 'TimeoutStopSec=3900s' ${unitFile}
+                grep -q -- 'Restart=on-failure' ${unitFile}
+
+                grep -q -- 'path = "/var/lib/kuroko/kuroko.db"' ${generated}
+                grep -q -- 'bind = "127.0.0.1:8787"' ${generated}
+                grep -q -- 'command = "cat"' ${generated}
+                grep -q -- 'agent' ${generated}
+
+                touch $out
+              '';
           };
 
           packages = {
