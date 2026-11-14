@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -76,6 +77,7 @@ fn the_defaults_match_the_documented_ones() {
     assert_eq!(config.replay_window, Millis(60_000));
     assert_eq!(config.limits.in_flight.get(), 1);
     assert_eq!(config.limits.max_queued.get(), 64);
+    assert_eq!(config.store, PathBuf::from("kuroko.db"));
     assert!(config.triggers.any_delegate);
     assert_eq!(config.triggers.delegate_ids, Vec::new());
     assert_eq!(config.triggers.label_names, Vec::new());
@@ -190,6 +192,65 @@ fn a_zero_limit_is_a_boot_error() {
 
     assert!(
         error(&text).contains("`[dispatch] max_queued` must be at least 1"),
+        "{}",
+        error(&text)
+    );
+}
+
+#[test]
+fn a_store_path_can_be_configured() {
+    let text = format!(
+        "{}\n[store]\npath = \"/var/lib/kuroko/tasks.db\"\n",
+        minimal()
+    );
+    let config = Config::from_toml(&text, None).unwrap();
+
+    assert_eq!(config.store, PathBuf::from("/var/lib/kuroko/tasks.db"));
+}
+
+#[test]
+fn an_empty_store_path_is_a_boot_error() {
+    let text = format!("{}\n[store]\npath = \"\"\n", minimal());
+
+    assert!(
+        error(&text).contains("`[store] path` must not be empty"),
+        "{}",
+        error(&text)
+    );
+}
+
+#[test]
+fn a_relative_store_path_resolves_beside_the_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kuroko.toml");
+    std::fs::write(
+        &path,
+        format!("{}\n[store]\npath = \"tasks.db\"\n", minimal()),
+    )
+    .unwrap();
+
+    let config = Config::load(&path).unwrap();
+
+    assert_eq!(config.store, dir.path().join("tasks.db"));
+}
+
+#[test]
+fn an_empty_delegate_id_is_a_boot_error() {
+    let text = format!("{}\n[trigger]\ndelegate_ids = [\"\"]\n", minimal());
+
+    assert!(
+        error(&text).contains("must not contain an empty id"),
+        "{}",
+        error(&text)
+    );
+}
+
+#[test]
+fn an_empty_label_name_is_a_boot_error() {
+    let text = format!("{}\n[trigger]\nlabel_names = [\"\"]\n", minimal());
+
+    assert!(
+        error(&text).contains("must not contain an empty name"),
         "{}",
         error(&text)
     );

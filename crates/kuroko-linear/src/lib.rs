@@ -319,6 +319,7 @@ impl IssueData {
             .as_ref()
             .and_then(Delegate::id)
             .or(self.delegate_id.as_deref())
+            .filter(|id| !id.is_empty())
     }
 }
 

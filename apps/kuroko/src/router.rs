@@ -8,7 +8,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use kuroko_core::{Clock, Submission, Task, TaskRequest};
+use kuroko_core::{Clock, Submission, Task, TaskKey, TaskRequest};
 use kuroko_engine::Engine;
 use kuroko_linear::{Gate, Intake, Rejection};
 use tokio::time::timeout;
@@ -55,15 +55,24 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
     };
     match intake {
         Intake::Admit(request) => admit(&state, request).await,
-        Intake::Withdraw(key) => {
-            if state.engine.withdraw(key).await.is_err() {
-                log::warn!("engine down, withdraw ignored");
-            }
-            StatusCode::OK
-        }
+        Intake::Withdraw(key) => withdraw(&state, key).await,
         Intake::Drop(reason) => {
             log::info!("delivery dropped: {reason:?}");
             StatusCode::OK
+        }
+    }
+}
+
+async fn withdraw(state: &AppState, key: TaskKey) -> StatusCode {
+    match timeout(SUBMIT_TIMEOUT, state.engine.withdraw(key)).await {
+        Ok(Ok(())) => StatusCode::OK,
+        Ok(Err(error)) => {
+            log::warn!("withdraw refused: {error}");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        Err(_) => {
+            log::warn!("engine did not answer within two seconds, withdraw refused");
+            StatusCode::SERVICE_UNAVAILABLE
         }
     }
 }
@@ -83,8 +92,8 @@ async fn admit(state: &AppState, request: TaskRequest) -> StatusCode {
             log::warn!("queue full, refused {identifier}");
             StatusCode::SERVICE_UNAVAILABLE
         }
-        Ok(Err(_)) => {
-            log::warn!("engine down, refused {identifier}");
+        Ok(Err(error)) => {
+            log::warn!("{error}, refused {identifier}");
             StatusCode::SERVICE_UNAVAILABLE
         }
         Err(_) => {

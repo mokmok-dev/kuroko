@@ -1,0 +1,18 @@
+[package]
+name = "kuroko-store"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+kuroko-core = { version = "2026.11.1", path = "../kuroko-core" }
+rusqlite = { version = "0.41.1", default-features = false, features = [
+  "bundled",
+] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

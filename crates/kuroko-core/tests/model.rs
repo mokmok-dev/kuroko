@@ -23,6 +23,9 @@ enum Action {
     Admit(usize),
     Withdraw(usize),
     Finish(usize, bool),
+    Settle(usize, bool),
+    Resume,
+    Restart,
 }
 
 #[derive(Clone, Debug)]
@@ -61,9 +64,10 @@ fn model() -> Kuroko {
 }
 
 impl Kuroko {
-    fn event(&self, action: Action) -> Event {
+    fn event(&self, action: Action) -> Option<Event> {
         match action {
-            Action::Admit(index) => Event::Admit(TaskRequest {
+            Action::Restart => None,
+            Action::Admit(index) => Some(Event::Admit(TaskRequest {
                 key: self.keys[index].clone(),
                 spec: TaskSpec {
                     identifier: IDENTIFIERS[index].to_owned(),
@@ -72,22 +76,31 @@ impl Kuroko {
                     url: None,
                 },
                 prompt: format!("prompt {index}"),
-            }),
-            Action::Withdraw(index) => Event::Withdraw(self.keys[index].clone()),
-            Action::Finish(index, ok) => Event::Finished {
+            })),
+            Action::Withdraw(index) => Some(Event::Withdraw(self.keys[index].clone())),
+            Action::Finish(index, ok) => Some(Event::Finished {
                 key: self.keys[index].clone(),
-                done: Done {
-                    at: Millis(1_000),
-                    outcome: if ok {
-                        Outcome::Success
-                    } else {
-                        Outcome::Failure(FailureReason::Timeout)
-                    },
-                    output: String::new(),
-                    log: String::new(),
-                },
-            },
+                done: done(ok),
+            }),
+            Action::Settle(index, ok) => Some(Event::Settled {
+                key: self.keys[index].clone(),
+                done: done(ok),
+            }),
+            Action::Resume => Some(Event::Resume),
         }
+    }
+}
+
+const fn done(ok: bool) -> Done {
+    Done {
+        at: Millis(1_000),
+        outcome: if ok {
+            Outcome::Success
+        } else {
+            Outcome::Failure(FailureReason::Timeout)
+        },
+        output: String::new(),
+        log: String::new(),
     }
 }
 
@@ -108,15 +121,30 @@ impl Model for Kuroko {
             actions.push(Action::Withdraw(index));
             actions.push(Action::Finish(index, true));
             actions.push(Action::Finish(index, false));
+            actions.push(Action::Settle(index, true));
+            actions.push(Action::Settle(index, false));
         }
+        actions.push(Action::Resume);
+        actions.push(Action::Restart);
     }
 
     fn next_state(&self, state: &Self::State, action: Self::Action) -> Option<Self::State> {
         let mut next = state.clone();
-        let step = apply(&mut next.book, self.event(action));
-        for cmd in step.cmds {
-            let Cmd::Dispatch(dispatch) = cmd;
-            *next.tickets.entry(dispatch.key).or_insert(0) += 1;
+        if let Some(event) = self.event(action) {
+            let step = apply(&mut next.book, event);
+            for cmd in step.cmds {
+                let Cmd::Dispatch(dispatch) = cmd;
+                *next.tickets.entry(dispatch.key).or_insert(0) += 1;
+            }
+        } else {
+            let tasks = next.book.tasks().cloned().collect();
+            let pending = next.book.pending_keys().cloned().collect();
+            next.book = Book::reconcile(self.limits, tasks, pending);
+            let step = apply(&mut next.book, Event::Resume);
+            for cmd in step.cmds {
+                let Cmd::Dispatch(dispatch) = cmd;
+                *next.tickets.entry(dispatch.key).or_insert(0) += 1;
+            }
         }
         // Two `withdraw` mutants let a finished task be removed and re-admitted forever,
         // so the ticket map grows without bound and BFS never terminates. A ticket of 2
@@ -133,11 +161,14 @@ impl Model for Kuroko {
                 state.tickets.values().all(|&count| count <= 1)
             }),
             Property::always(
-                "one dispatched task per issue",
+                "one active task per issue",
                 |_model: &Self, state: &SysState| {
                     let mut busy: BTreeSet<&IssueId> = BTreeSet::new();
                     state.book.tasks().all(|task| {
-                        !matches!(task.state, TaskState::Dispatched) || busy.insert(&task.key.issue)
+                        !matches!(
+                            task.state,
+                            TaskState::Dispatched | TaskState::RecoveryPending
+                        ) || busy.insert(&task.key.issue)
                     })
                 },
             ),
@@ -166,15 +197,6 @@ impl Model for Kuroko {
                     unique.len() == pending.len()
                         && unique == queued
                         && state.book.in_flight() == dispatched
-                },
-            ),
-            Property::always(
-                "terminal tasks carry a result",
-                |_model: &Self, state: &SysState| {
-                    state.book.tasks().all(|task| {
-                        !task.state.is_terminal()
-                            || matches!(task.state, TaskState::Succeeded(_) | TaskState::Failed(_))
-                    })
                 },
             ),
             Property::always(

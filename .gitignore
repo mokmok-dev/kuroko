@@ -3,5 +3,6 @@
 /result
 /result-*
 /target
+kuroko.db*
 mutants.out
 mutants.out.old

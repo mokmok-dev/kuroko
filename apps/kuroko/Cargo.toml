@@ -10,6 +10,7 @@ env_logger = "0.11.11"
 kuroko-core = { version = "2026.11.1", path = "../../crates/kuroko-core" }
 kuroko-engine = { version = "2026.11.1", path = "../../crates/kuroko-engine" }
 kuroko-linear = { version = "2026.11.1", path = "../../crates/kuroko-linear" }
+kuroko-store = { version = "2026.11.1", path = "../../crates/kuroko-store" }
 kuroko-transport = { version = "2026.11.1", path = "../../crates/kuroko-transport" }
 log = "0.4.35"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -27,6 +28,7 @@ toml = "1.2.1"
 hex = "0.4.3"
 hmac = "0.13.0"
 sha2 = "0.11.1"
+tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
 
 [lints]
