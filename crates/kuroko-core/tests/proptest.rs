@@ -39,6 +39,8 @@ enum Op {
     Admit(usize),
     Withdraw(usize),
     Finish(usize, bool),
+    Settle(usize, bool),
+    Resume,
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -46,6 +48,8 @@ fn op() -> impl Strategy<Value = Op> {
         (0..KEY_COUNT).prop_map(Op::Admit),
         (0..KEY_COUNT).prop_map(Op::Withdraw),
         (0..KEY_COUNT, any::<bool>()).prop_map(|(index, ok)| Op::Finish(index, ok)),
+        (0..KEY_COUNT, any::<bool>()).prop_map(|(index, ok)| Op::Settle(index, ok)),
+        Just(Op::Resume),
     ]
 }
 
@@ -71,17 +75,26 @@ fn event(op: Op, keys: &[TaskKey; KEY_COUNT]) -> Event {
         Op::Withdraw(index) => Event::Withdraw(keys[index].clone()),
         Op::Finish(index, ok) => Event::Finished {
             key: keys[index].clone(),
-            done: Done {
-                at: Millis(50),
-                outcome: if ok {
-                    Outcome::Success
-                } else {
-                    Outcome::Failure(FailureReason::Timeout)
-                },
-                output: String::new(),
-                log: String::new(),
-            },
+            done: done(ok),
         },
+        Op::Settle(index, ok) => Event::Settled {
+            key: keys[index].clone(),
+            done: done(ok),
+        },
+        Op::Resume => Event::Resume,
+    }
+}
+
+const fn done(ok: bool) -> Done {
+    Done {
+        at: Millis(50),
+        outcome: if ok {
+            Outcome::Success
+        } else {
+            Outcome::Failure(FailureReason::Timeout)
+        },
+        output: String::new(),
+        log: String::new(),
     }
 }
 
@@ -132,10 +145,15 @@ fn assert_invariants(book: &Book, limits: Limits, arrival: &BTreeMap<TaskKey, u6
         if task.state.is_terminal() {
             assert!(matches!(
                 task.state,
-                TaskState::Succeeded(_) | TaskState::Failed(_)
+                TaskState::Succeeded(_) | TaskState::Failed(_) | TaskState::Withdrawn
             ));
         }
     }
+    assert!(
+        !pending_set
+            .iter()
+            .any(|key| book.task(key).is_some_and(|task| task.state.is_terminal()))
+    );
 }
 
 proptest! {
@@ -155,10 +173,14 @@ proptest! {
         let mut admissions: u64 = 0;
 
         for op in ops {
-            let key = match op {
-                Op::Admit(index) | Op::Withdraw(index) | Op::Finish(index, _) => &keys[index],
+            let index = match op {
+                Op::Admit(index)
+                | Op::Withdraw(index)
+                | Op::Finish(index, _)
+                | Op::Settle(index, _) => Some(index),
+                Op::Resume => None,
             };
-            let present = book.task(key).is_some();
+            let present = index.is_some_and(|index| book.task(&keys[index]).is_some());
             let pending_len = book.pending_keys().count();
             let step = apply(&mut book, event(op, &keys));
 
@@ -168,7 +190,7 @@ proptest! {
                     Some(expected_submission(present, pending_len, limits))
                 );
                 if step.submission == Some(Submission::Accepted) {
-                    arrival.insert(key.clone(), admissions);
+                    arrival.insert(keys[index.unwrap()].clone(), admissions);
                     admissions += 1;
                 }
             } else {

@@ -6,10 +6,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use kuroko_core::{
-    Clock, Dispatch, Done, FailureReason, IssueId, LabelName, Limits, Millis, Outcome, Source,
-    Submission, TaskKey, TaskRequest, TaskSpec, TaskState, TriggerId,
+    Book, Clock, Dispatch, Done, Event, FailureReason, IssueId, Journal, JournalError, LabelName,
+    Limits, Millis, Outcome, Source, Submission, TaskKey, TaskRequest, TaskSpec, TaskState,
+    TriggerId, apply,
 };
-use kuroko_engine::{BoxFuture, EngineDown, Transport, spawn};
+use kuroko_engine::{BoxFuture, EngineError, Transport, spawn};
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
@@ -18,6 +19,89 @@ struct FixedClock(Millis);
 impl Clock for FixedClock {
     fn now_ms(&self) -> Millis {
         self.0
+    }
+}
+
+struct NoopJournal;
+
+impl Journal for NoopJournal {
+    fn persist(&self, _book: &Book) -> Result<(), JournalError> {
+        Ok(())
+    }
+}
+
+struct FailingJournal;
+
+impl Journal for FailingJournal {
+    fn persist(&self, _book: &Book) -> Result<(), JournalError> {
+        Err(JournalError::new("disk full"))
+    }
+}
+
+struct FlakyJournal {
+    failing: AtomicBool,
+}
+
+impl FlakyJournal {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            failing: AtomicBool::new(false),
+        })
+    }
+}
+
+impl Journal for FlakyJournal {
+    fn persist(&self, _book: &Book) -> Result<(), JournalError> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(JournalError::new("disk full"));
+        }
+        Ok(())
+    }
+}
+
+/// Fails the persist after `allowed` successful writes.
+struct FailAfter {
+    allowed: usize,
+    attempts: AtomicUsize,
+}
+
+impl FailAfter {
+    fn new(allowed: usize) -> Arc<Self> {
+        Arc::new(Self {
+            allowed,
+            attempts: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl Journal for FailAfter {
+    fn persist(&self, _book: &Book) -> Result<(), JournalError> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        if attempt >= self.allowed {
+            return Err(JournalError::new("disk full"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RecordingJournal {
+    saved: std::sync::Mutex<Vec<Book>>,
+}
+
+impl Journal for RecordingJournal {
+    fn persist(&self, book: &Book) -> Result<(), JournalError> {
+        self.saved
+            .lock()
+            .map_err(|_| JournalError::new("poisoned"))?
+            .push(book.clone());
+        Ok(())
+    }
+}
+
+impl RecordingJournal {
+    fn last(&self) -> Option<Book> {
+        self.saved.lock().ok()?.last().cloned()
     }
 }
 
@@ -148,7 +232,12 @@ async fn next_start(starts: &mut mpsc::UnboundedReceiver<TaskKey>) -> TaskKey {
 async fn duplicate_delivery_runs_the_transport_once() {
     let (gate, gate_rx) = watch::channel(false);
     let (transport, mut starts) = Gated::new(gate_rx);
-    let (engine, handle) = spawn(transport, limits(1, 4), Arc::new(FixedClock(Millis(10))));
+    let (engine, handle) = spawn(
+        transport,
+        Book::new(limits(1, 4)),
+        Arc::new(FixedClock(Millis(10))),
+        Arc::new(NoopJournal),
+    );
 
     let admitted = request(key("issue-a", "kuroko"), "MOK-1", "prompt");
     assert_eq!(
@@ -166,6 +255,7 @@ async fn duplicate_delivery_runs_the_transport_once() {
     timeout(Duration::from_secs(1), handle)
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
     assert!(starts.try_recv().is_err());
 }
@@ -176,8 +266,9 @@ async fn a_second_dispatch_waits_for_the_first_to_finish() {
     let (transport, mut starts) = Gated::new(gate_rx);
     let (engine, handle) = spawn(
         transport.clone(),
-        limits(1, 4),
+        Book::new(limits(1, 4)),
         Arc::new(FixedClock(Millis(10))),
+        Arc::new(NoopJournal),
     );
 
     assert_eq!(
@@ -205,6 +296,7 @@ async fn a_second_dispatch_waits_for_the_first_to_finish() {
     timeout(Duration::from_secs(1), handle)
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
 }
 
@@ -212,7 +304,12 @@ async fn a_second_dispatch_waits_for_the_first_to_finish() {
 async fn a_panicking_transport_settles_as_panicked_and_frees_the_slot() {
     let (gate, gate_rx) = watch::channel(false);
     let (transport, mut starts) = Exploding::new(gate_rx);
-    let (engine, handle) = spawn(transport, limits(1, 4), Arc::new(FixedClock(Millis(5))));
+    let (engine, handle) = spawn(
+        transport,
+        Book::new(limits(1, 4)),
+        Arc::new(FixedClock(Millis(5))),
+        Arc::new(NoopJournal),
+    );
 
     assert_eq!(
         engine
@@ -252,6 +349,7 @@ async fn a_panicking_transport_settles_as_panicked_and_frees_the_slot() {
     timeout(Duration::from_secs(1), handle)
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
 }
 
@@ -259,7 +357,12 @@ async fn a_panicking_transport_settles_as_panicked_and_frees_the_slot() {
 async fn a_full_queue_returns_full() {
     let (gate, gate_rx) = watch::channel(false);
     let (transport, mut starts) = Gated::new(gate_rx);
-    let (engine, handle) = spawn(transport, limits(1, 1), Arc::new(FixedClock(Millis(10))));
+    let (engine, handle) = spawn(
+        transport,
+        Book::new(limits(1, 1)),
+        Arc::new(FixedClock(Millis(10))),
+        Arc::new(NoopJournal),
+    );
 
     assert_eq!(
         engine
@@ -286,6 +389,7 @@ async fn a_full_queue_returns_full() {
     timeout(Duration::from_secs(1), handle)
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
 }
 
@@ -293,7 +397,12 @@ async fn a_full_queue_returns_full() {
 async fn snapshot_reflects_the_book() {
     let (gate, gate_rx) = watch::channel(false);
     let (transport, mut starts) = Gated::new(gate_rx);
-    let (engine, handle) = spawn(transport, limits(1, 4), Arc::new(FixedClock(Millis(10))));
+    let (engine, handle) = spawn(
+        transport,
+        Book::new(limits(1, 4)),
+        Arc::new(FixedClock(Millis(10))),
+        Arc::new(NoopJournal),
+    );
 
     let admitted = key("issue-a", "kuroko");
     assert_eq!(
@@ -316,6 +425,7 @@ async fn snapshot_reflects_the_book() {
     timeout(Duration::from_secs(1), handle)
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
 }
 
@@ -325,8 +435,9 @@ async fn shutdown_joins_only_after_the_in_flight_dispatch_finishes() {
     let (transport, mut starts) = Gated::new(gate_rx);
     let (engine, handle) = spawn(
         transport.clone(),
-        limits(1, 4),
+        Book::new(limits(1, 4)),
         Arc::new(FixedClock(Millis(10))),
+        Arc::new(NoopJournal),
     );
 
     assert_eq!(
@@ -347,6 +458,7 @@ async fn shutdown_joins_only_after_the_in_flight_dispatch_finishes() {
     timeout(Duration::from_secs(1), handle)
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
     assert!(transport.completed.load(Ordering::SeqCst));
 }
@@ -357,8 +469,9 @@ async fn a_queued_task_stays_unstarted_after_stop() {
     let (transport, mut starts) = Gated::new(gate_rx);
     let (engine, handle) = spawn(
         transport.clone(),
-        limits(1, 4),
+        Book::new(limits(1, 4)),
         Arc::new(FixedClock(Millis(10))),
+        Arc::new(NoopJournal),
     );
 
     assert_eq!(
@@ -385,6 +498,7 @@ async fn a_queued_task_stays_unstarted_after_stop() {
     timeout(Duration::from_secs(1), handle)
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
 
     assert!(transport.completed.load(Ordering::SeqCst));
@@ -396,7 +510,12 @@ async fn a_queued_task_stays_unstarted_after_stop() {
 async fn a_submit_after_drop_returns_engine_down() {
     let (gate, gate_rx) = watch::channel(false);
     let (transport, _starts) = Gated::new(gate_rx);
-    let (engine, handle) = spawn(transport, limits(1, 4), Arc::new(FixedClock(Millis(10))));
+    let (engine, handle) = spawn(
+        transport,
+        Book::new(limits(1, 4)),
+        Arc::new(FixedClock(Millis(10))),
+        Arc::new(NoopJournal),
+    );
 
     let probe = engine.clone();
     drop(engine);
@@ -405,17 +524,18 @@ async fn a_submit_after_drop_returns_engine_down() {
         probe
             .submit(request(key("issue-a", "kuroko"), "MOK-1", "a"))
             .await,
-        Err(EngineDown)
+        Err(EngineError::Down)
     );
     assert_eq!(
         probe.withdraw(key("issue-a", "kuroko")).await,
-        Err(EngineDown)
+        Err(EngineError::Down)
     );
-    assert_eq!(probe.snapshot().await, Err(EngineDown));
+    assert_eq!(probe.snapshot().await, Err(EngineError::Down));
 
     gate.send(true).unwrap();
     timeout(Duration::from_secs(1), handle)
         .await
+        .unwrap()
         .unwrap()
         .unwrap();
 }
@@ -424,7 +544,12 @@ async fn a_submit_after_drop_returns_engine_down() {
 async fn the_engine_stamps_done_at_from_its_clock() {
     let (gate, gate_rx) = watch::channel(false);
     let (transport, mut starts) = Gated::new(gate_rx);
-    let (engine, handle) = spawn(transport, limits(1, 4), Arc::new(FixedClock(Millis(42))));
+    let (engine, handle) = spawn(
+        transport,
+        Book::new(limits(1, 4)),
+        Arc::new(FixedClock(Millis(42))),
+        Arc::new(NoopJournal),
+    );
 
     let first = key("issue-a", "kuroko");
     assert_eq!(
@@ -454,14 +579,20 @@ async fn the_engine_stamps_done_at_from_its_clock() {
     timeout(Duration::from_secs(1), handle)
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
 }
 
 #[tokio::test(start_paused = true)]
-async fn withdraw_removes_a_queued_task() {
+async fn withdraw_leaves_a_tombstone() {
     let (gate, gate_rx) = watch::channel(false);
     let (transport, mut starts) = Gated::new(gate_rx);
-    let (engine, handle) = spawn(transport, limits(1, 4), Arc::new(FixedClock(Millis(10))));
+    let (engine, handle) = spawn(
+        transport,
+        Book::new(limits(1, 4)),
+        Arc::new(FixedClock(Millis(10))),
+        Arc::new(NoopJournal),
+    );
 
     let running = key("issue-a", "kuroko");
     assert_eq!(
@@ -469,21 +600,26 @@ async fn withdraw_removes_a_queued_task() {
         Ok(Submission::Accepted)
     );
     next_start(&mut starts).await;
+    let queued = key("issue-b", "kuroko");
     assert_eq!(
-        engine
-            .submit(request(key("issue-b", "kuroko"), "MOK-2", "b"))
-            .await,
+        engine.submit(request(queued.clone(), "MOK-2", "b")).await,
         Ok(Submission::Accepted)
     );
 
-    engine.withdraw(key("issue-b", "kuroko")).await.unwrap();
+    engine.withdraw(queued.clone()).await.unwrap();
 
     let tasks = engine.snapshot().await.unwrap();
     assert!(tasks.iter().any(|task| task.key == running));
-    assert!(
-        !tasks
+    assert_eq!(
+        tasks
             .iter()
-            .any(|task| task.key == key("issue-b", "kuroko"))
+            .find(|task| task.key == queued)
+            .map(|task| &task.state),
+        Some(&TaskState::Withdrawn)
+    );
+    assert_eq!(
+        engine.submit(request(queued, "MOK-2", "b")).await,
+        Ok(Submission::Duplicate)
     );
 
     gate.send(true).unwrap();
@@ -491,5 +627,309 @@ async fn withdraw_removes_a_queued_task() {
     timeout(Duration::from_secs(1), handle)
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_store_failure_refuses_admission_without_dispatching() {
+    let (_gate, gate_rx) = watch::channel(false);
+    let (transport, mut starts) = Gated::new(gate_rx);
+    let (engine, handle) = spawn(
+        transport.clone(),
+        Book::new(limits(1, 4)),
+        Arc::new(FixedClock(Millis(10))),
+        Arc::new(FailingJournal),
+    );
+
+    assert_eq!(
+        engine
+            .submit(request(key("issue-a", "kuroko"), "MOK-1", "a"))
+            .await,
+        Err(EngineError::Store)
+    );
+    assert!(starts.try_recv().is_err());
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(engine.snapshot().await.unwrap(), Vec::new());
+
+    drop(engine);
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_store_failure_on_withdraw_keeps_the_task() {
+    let (gate, gate_rx) = watch::channel(false);
+    let (transport, mut starts) = Gated::new(gate_rx);
+    let journal = FlakyJournal::new();
+    let (engine, handle) = spawn(
+        transport,
+        Book::new(limits(1, 4)),
+        Arc::new(FixedClock(Millis(10))),
+        journal.clone(),
+    );
+
+    assert_eq!(
+        engine
+            .submit(request(key("issue-a", "kuroko"), "MOK-1", "a"))
+            .await,
+        Ok(Submission::Accepted)
+    );
+    next_start(&mut starts).await;
+    let queued = key("issue-b", "kuroko");
+    assert_eq!(
+        engine.submit(request(queued.clone(), "MOK-2", "b")).await,
+        Ok(Submission::Accepted)
+    );
+
+    journal.failing.store(true, Ordering::SeqCst);
+    assert_eq!(
+        engine.withdraw(queued.clone()).await,
+        Err(EngineError::Store)
+    );
+    let tasks = engine.snapshot().await.unwrap();
+    assert_eq!(
+        tasks
+            .iter()
+            .find(|task| task.key == queued)
+            .map(|task| &task.state),
+        Some(&TaskState::Queued)
+    );
+
+    journal.failing.store(false, Ordering::SeqCst);
+    gate.send(true).unwrap();
+    drop(engine);
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_pending_blocks_the_issue_without_running_it() {
+    let mut crashed = Book::new(limits(1, 4));
+    let interrupted = key("issue-a", "kuroko");
+    let same_issue = key("issue-a", "label");
+    let other_issue = key("issue-b", "kuroko");
+    let _ = apply(
+        &mut crashed,
+        Event::Admit(request(interrupted.clone(), "MOK-1", "a")),
+    );
+    let _ = apply(
+        &mut crashed,
+        Event::Admit(request(same_issue.clone(), "MOK-1", "b")),
+    );
+    let _ = apply(
+        &mut crashed,
+        Event::Admit(request(other_issue.clone(), "MOK-2", "c")),
+    );
+    let recovered = Book::reconcile(
+        limits(1, 4),
+        crashed.tasks().cloned().collect(),
+        crashed.pending_keys().cloned().collect(),
+    );
+
+    let (gate, gate_rx) = watch::channel(false);
+    let (transport, mut starts) = Gated::new(gate_rx);
+    let (engine, handle) = spawn(
+        transport.clone(),
+        recovered,
+        Arc::new(FixedClock(Millis(10))),
+        Arc::new(NoopJournal),
+    );
+
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+    let tasks = engine.snapshot().await.unwrap();
+    assert_eq!(
+        tasks
+            .iter()
+            .find(|task| task.key == interrupted)
+            .map(|task| &task.state),
+        Some(&TaskState::RecoveryPending)
+    );
+
+    assert_eq!(
+        engine
+            .submit(request(key("issue-c", "kuroko"), "MOK-3", "d"))
+            .await,
+        Ok(Submission::Accepted)
+    );
+    assert_eq!(next_start(&mut starts).await, other_issue);
+    assert!(starts.try_recv().is_err());
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+
+    gate.send(true).unwrap();
+    drop(engine);
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn startup_resumes_the_restored_queue() {
+    let mut crashed = Book::new(limits(1, 4));
+    let interrupted = key("issue-a", "kuroko");
+    let queued = key("issue-b", "kuroko");
+    let _ = apply(
+        &mut crashed,
+        Event::Admit(request(interrupted.clone(), "MOK-1", "a")),
+    );
+    let _ = apply(
+        &mut crashed,
+        Event::Admit(request(queued.clone(), "MOK-2", "b")),
+    );
+    let recovered = Book::reconcile(
+        limits(1, 4),
+        crashed.tasks().cloned().collect(),
+        crashed.pending_keys().cloned().collect(),
+    );
+
+    let (gate, gate_rx) = watch::channel(false);
+    let (transport, mut starts) = Gated::new(gate_rx);
+    let (engine, handle) = spawn(
+        transport.clone(),
+        recovered,
+        Arc::new(FixedClock(Millis(10))),
+        Arc::new(NoopJournal),
+    );
+
+    assert_eq!(next_start(&mut starts).await, queued);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+    let tasks = engine.snapshot().await.unwrap();
+    assert_eq!(
+        tasks
+            .iter()
+            .find(|task| task.key == interrupted)
+            .map(|task| &task.state),
+        Some(&TaskState::RecoveryPending)
+    );
+
+    gate.send(true).unwrap();
+    drop(engine);
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_resume_persist_stops_the_engine_before_dispatching() {
+    let mut crashed = Book::new(limits(1, 4));
+    let _ = apply(
+        &mut crashed,
+        Event::Admit(request(key("issue-a", "kuroko"), "MOK-1", "a")),
+    );
+    let _ = apply(
+        &mut crashed,
+        Event::Admit(request(key("issue-b", "kuroko"), "MOK-2", "b")),
+    );
+    let recovered = Book::reconcile(
+        limits(1, 4),
+        crashed.tasks().cloned().collect(),
+        crashed.pending_keys().cloned().collect(),
+    );
+
+    let (_gate, gate_rx) = watch::channel(false);
+    let (transport, mut starts) = Gated::new(gate_rx);
+    let (engine, handle) = spawn(
+        transport.clone(),
+        recovered,
+        Arc::new(FixedClock(Millis(10))),
+        Arc::new(FailingJournal),
+    );
+
+    let outcome = timeout(Duration::from_secs(1), handle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, Err(EngineError::Store));
+    assert!(starts.try_recv().is_err());
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+    drop(engine);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_completion_persist_stops_the_engine() {
+    let (gate, gate_rx) = watch::channel(false);
+    let (transport, mut starts) = Gated::new(gate_rx);
+    let journal = FailAfter::new(1);
+    let (engine, handle) = spawn(
+        transport,
+        Book::new(limits(1, 4)),
+        Arc::new(FixedClock(Millis(10))),
+        journal,
+    );
+
+    assert_eq!(
+        engine
+            .submit(request(key("issue-a", "kuroko"), "MOK-1", "a"))
+            .await,
+        Ok(Submission::Accepted)
+    );
+    next_start(&mut starts).await;
+    gate.send(true).unwrap();
+
+    let outcome = timeout(Duration::from_secs(1), handle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, Err(EngineError::Store));
+    assert_eq!(engine.snapshot().await, Err(EngineError::Down));
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_persists_the_result_without_starting_the_queue() {
+    let (gate, gate_rx) = watch::channel(false);
+    let (transport, mut starts) = Gated::new(gate_rx);
+    let journal = Arc::new(RecordingJournal::default());
+    let (engine, handle) = spawn(
+        transport,
+        Book::new(limits(1, 4)),
+        Arc::new(FixedClock(Millis(10))),
+        journal.clone(),
+    );
+
+    let running = key("issue-a", "kuroko");
+    let queued = key("issue-b", "kuroko");
+    assert_eq!(
+        engine.submit(request(running.clone(), "MOK-1", "a")).await,
+        Ok(Submission::Accepted)
+    );
+    next_start(&mut starts).await;
+    assert_eq!(
+        engine.submit(request(queued.clone(), "MOK-2", "b")).await,
+        Ok(Submission::Accepted)
+    );
+
+    drop(engine);
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!handle.is_finished());
+
+    gate.send(true).unwrap();
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    let saved = journal.last().expect("a persisted book");
+    assert!(matches!(
+        saved.task(&running).map(|task| &task.state),
+        Some(TaskState::Succeeded(_))
+    ));
+    assert_eq!(
+        saved.task(&queued).map(|task| &task.state),
+        Some(&TaskState::Queued)
+    );
+    assert_eq!(saved.in_flight(), 0);
+    assert_eq!(saved.pending_keys().count(), 1);
 }

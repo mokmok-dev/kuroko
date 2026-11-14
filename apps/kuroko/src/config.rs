@@ -16,6 +16,7 @@ pub const DEFAULT_PATH: &str = "kuroko.toml";
 pub const SECRET_ENV: &str = "KUROKO_LINEAR_SECRET";
 
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
+const DEFAULT_STORE_PATH: &str = "kuroko.db";
 const DEFAULT_TEMPLATE: &str = "Issue {identifier}: {title}\n\n{description}\n{url}";
 const DEFAULT_WINDOW_SECS: i64 = 60;
 const DEFAULT_TIMEOUT_SECS: u64 = 3600;
@@ -32,6 +33,7 @@ pub struct Config {
     pub template: PromptTemplate,
     pub limits: Limits,
     pub transport: TransportChoice,
+    pub store: PathBuf,
 }
 
 /// The one transport the operator configured.
@@ -84,7 +86,15 @@ impl Config {
             source,
         })?;
         let secret = std::env::var(SECRET_ENV).ok();
-        Self::from_toml(&text, secret.as_deref())
+        let mut config = Self::from_toml(&text, secret.as_deref())?;
+        // A relative store path belongs beside the config, so a launch from another
+        // working directory does not scatter the database and its WAL files.
+        if config.store.is_relative()
+            && let Some(parent) = path.parent()
+        {
+            config.store = parent.join(&config.store);
+        }
+        Ok(config)
     }
 
     /// Parses `text` and applies `secret_override` over `[linear] secret`.
@@ -112,6 +122,8 @@ struct RawConfig {
     #[serde(default)]
     prompt: PromptSection,
     #[serde(default)]
+    store: StoreSection,
+    #[serde(default)]
     transport: RawTransport,
 }
 
@@ -132,7 +144,9 @@ struct LinearSection {
 #[serde(deny_unknown_fields)]
 struct TriggerSection {
     any_delegate: Option<bool>,
+    #[serde(default)]
     delegate_ids: Vec<String>,
+    #[serde(default)]
     label_names: Vec<String>,
 }
 
@@ -147,6 +161,12 @@ struct DispatchSection {
 #[serde(deny_unknown_fields)]
 struct PromptSection {
     template: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreSection {
+    path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -180,6 +200,7 @@ impl RawConfig {
             trigger,
             dispatch,
             prompt,
+            store,
             transport,
         } = self;
 
@@ -236,6 +257,22 @@ impl RawConfig {
             }
         };
 
+        if trigger.delegate_ids.iter().any(String::is_empty) {
+            return Err(invalid(
+                "`[trigger] delegate_ids` must not contain an empty id".to_owned(),
+            ));
+        }
+        if trigger.label_names.iter().any(String::is_empty) {
+            return Err(invalid(
+                "`[trigger] label_names` must not contain an empty name".to_owned(),
+            ));
+        }
+
+        let store_text = store.path.as_deref().unwrap_or(DEFAULT_STORE_PATH);
+        if store_text.is_empty() {
+            return Err(invalid("`[store] path` must not be empty".to_owned()));
+        }
+
         Ok(Config {
             bind,
             secret,
@@ -260,6 +297,7 @@ impl RawConfig {
             ),
             limits,
             transport,
+            store: PathBuf::from(store_text),
         })
     }
 }

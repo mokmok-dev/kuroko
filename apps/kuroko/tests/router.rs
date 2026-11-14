@@ -2,6 +2,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -9,7 +10,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use hmac::{Hmac, KeyInit, Mac};
 use kuroko::router::{AppState, router};
-use kuroko_core::{Clock, Dispatch, Done, IssueId, Limits, Millis};
+use kuroko_core::{Book, Clock, Dispatch, Done, IssueId, Journal, JournalError, Limits, Millis};
 use kuroko_engine::{BoxFuture, Transport, spawn};
 use kuroko_linear::{Gate, PromptTemplate, TriggerConfig, WebhookSecret};
 use serde_json::{Value, json};
@@ -30,6 +31,39 @@ struct FixedClock(Millis);
 impl Clock for FixedClock {
     fn now_ms(&self) -> Millis {
         self.0
+    }
+}
+
+struct NoopJournal;
+
+impl Journal for NoopJournal {
+    fn persist(&self, _book: &Book) -> Result<(), JournalError> {
+        Ok(())
+    }
+}
+
+struct ToggleJournal {
+    failing: AtomicBool,
+}
+
+impl ToggleJournal {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            failing: AtomicBool::new(false),
+        })
+    }
+
+    fn fail(&self) {
+        self.failing.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Journal for ToggleJournal {
+    fn persist(&self, _book: &Book) -> Result<(), JournalError> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(JournalError::new("disk full"));
+        }
+        Ok(())
     }
 }
 
@@ -55,6 +89,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(in_flight: usize, max_queued: usize) -> Self {
+        Self::with_journal(Arc::new(NoopJournal), in_flight, max_queued)
+    }
+
+    fn with_journal(journal: Arc<dyn Journal>, in_flight: usize, max_queued: usize) -> Self {
         let (started, dispatches) = mpsc::unbounded_channel();
         let transport = Arc::new(Holding { started });
         let limits = Limits {
@@ -62,7 +100,7 @@ impl Fixture {
             max_queued: NonZeroUsize::new(max_queued).unwrap(),
         };
         let clock: Arc<dyn Clock> = Arc::new(FixedClock(NOW));
-        let (engine, _task) = spawn(transport, limits, Arc::clone(&clock));
+        let (engine, _task) = spawn(transport, Book::new(limits), Arc::clone(&clock), journal);
         let engine = Arc::new(engine);
         let gate = Gate::new(
             WebhookSecret::new(SECRET),
@@ -249,4 +287,72 @@ async fn tasks_returns_the_snapshot() {
     assert_eq!(tasks[0]["key"]["issue"], "issue-a");
     assert_eq!(tasks[0]["spec"]["identifier"], "MOK-issue-a");
     assert_eq!(tasks[0]["state"], "Dispatched");
+}
+
+#[tokio::test]
+async fn a_store_failure_refuses_the_delivery() {
+    let journal = ToggleJournal::new();
+    journal.fail();
+    let fixture = Fixture::with_journal(journal, 1, 64);
+    let body = payload(NOW.0, "create", "issue-a", Some(AGENT), &[]);
+
+    assert_eq!(
+        fixture.post_signed(&body).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    let (status, tasks) = fixture.tasks().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tasks, json!([]));
+}
+
+#[tokio::test]
+async fn a_remove_delivery_leaves_a_withdrawn_tombstone() {
+    let mut fixture = Fixture::new(1, 64);
+    let running = payload(NOW.0, "create", "issue-a", Some(AGENT), &[]);
+    let queued = payload(NOW.0, "create", "issue-b", Some(AGENT), &[]);
+    assert_eq!(fixture.post_signed(&running).await, StatusCode::OK);
+    assert_eq!(fixture.post_signed(&queued).await, StatusCode::OK);
+    let _started = fixture.next_dispatch().await;
+
+    let remove = payload(NOW.0, "remove", "issue-b", Some(AGENT), &[]);
+    assert_eq!(fixture.post_signed(&remove).await, StatusCode::OK);
+
+    let (status, tasks) = fixture.tasks().await;
+    assert_eq!(status, StatusCode::OK);
+    let tasks = tasks.as_array().unwrap();
+    let withdrawn = tasks
+        .iter()
+        .find(|task| task["key"]["issue"] == "issue-b")
+        .unwrap();
+    assert_eq!(withdrawn["state"], "Withdrawn");
+    assert!(fixture.started.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn a_store_failure_refuses_the_withdraw() {
+    let journal = ToggleJournal::new();
+    let mut fixture = Fixture::with_journal(journal.clone(), 1, 64);
+    let running = payload(NOW.0, "create", "issue-a", Some(AGENT), &[]);
+    let queued = payload(NOW.0, "create", "issue-b", Some(AGENT), &[]);
+    assert_eq!(fixture.post_signed(&running).await, StatusCode::OK);
+    assert_eq!(fixture.post_signed(&queued).await, StatusCode::OK);
+    let _started = fixture.next_dispatch().await;
+
+    journal.fail();
+    let remove = payload(NOW.0, "remove", "issue-b", Some(AGENT), &[]);
+    assert_eq!(
+        fixture.post_signed(&remove).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    let (status, tasks) = fixture.tasks().await;
+    assert_eq!(status, StatusCode::OK);
+    let still_queued = tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["key"]["issue"] == "issue-b")
+        .unwrap();
+    assert_eq!(still_queued["state"], "Queued");
 }

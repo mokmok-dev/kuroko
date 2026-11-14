@@ -1,8 +1,8 @@
 use std::num::NonZeroUsize;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Millis(pub i64);
 
 pub trait Clock: Send + Sync {
@@ -22,6 +22,11 @@ impl IssueId {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -32,6 +37,11 @@ impl DelegateId {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -41,6 +51,11 @@ impl LabelName {
     #[must_use]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -72,7 +87,7 @@ pub struct TaskRequest {
     pub prompt: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FailureReason {
     Exit { code: Option<i32> },
     Timeout,
@@ -81,13 +96,13 @@ pub enum FailureReason {
     Panicked,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Outcome {
     Success,
     Failure(FailureReason),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Done {
     pub at: Millis,
     pub outcome: Outcome,
@@ -99,14 +114,19 @@ pub struct Done {
 pub enum TaskState {
     Queued,
     Dispatched,
+    /// A dispatch was recorded but the daemon stopped before recording its result.
+    /// It is never retried automatically because the agent may still be running.
+    RecoveryPending,
     Succeeded(Done),
     Failed(Done),
+    /// Tombstone for a withdrawn task. The key stays present so redelivery is a duplicate.
+    Withdrawn,
 }
 
 impl TaskState {
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
-        matches!(self, Self::Succeeded(_) | Self::Failed(_))
+        matches!(self, Self::Succeeded(_) | Self::Failed(_) | Self::Withdrawn)
     }
 }
 
@@ -122,7 +142,19 @@ pub struct Task {
 pub enum Event {
     Admit(TaskRequest),
     Withdraw(TaskKey),
-    Finished { key: TaskKey, done: Done },
+    Finished {
+        key: TaskKey,
+        done: Done,
+    },
+    /// Records a result without draining the queue. Used once shutdown has begun, so a
+    /// completed dispatch is persisted even though no new work may start.
+    Settled {
+        key: TaskKey,
+        done: Done,
+    },
+    /// Drains restored queued work after startup. `RecoveryPending` rows are skipped, so
+    /// it can never replay a dispatch whose agent may still be running.
+    Resume,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

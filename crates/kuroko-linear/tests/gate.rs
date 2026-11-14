@@ -290,6 +290,17 @@ fn a_delegate_arrives_as_delegate_id() {
 }
 
 #[test]
+fn an_empty_delegate_does_not_admit() {
+    let mut data = issue_data();
+    data["delegate"] = json!({ "id": "" });
+
+    assert_eq!(
+        dropped(accept(&any_delegate_gate(), &issue("create", &data)).unwrap()),
+        DropReason::Undelegated
+    );
+}
+
+#[test]
 fn any_delegate_admits_an_unlisted_id() {
     let mut data = issue_data();
     data["delegate"] = json!({ "id": "agent-9" });

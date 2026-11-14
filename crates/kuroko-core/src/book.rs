@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::task::{
     Cmd, Dispatch, Done, Event, IssueId, Limits, Outcome, Step, Submission, Task, TaskKey,
@@ -41,6 +41,37 @@ impl Book {
     pub const fn in_flight(&self) -> usize {
         self.in_flight
     }
+
+    /// Rebuilds the book from persisted rows without emitting any command.
+    ///
+    /// Every `Dispatched` row becomes [`TaskState::RecoveryPending`]: the agent may
+    /// still be running after a crash, so replaying it would duplicate side effects.
+    #[must_use]
+    pub fn reconcile(limits: Limits, tasks: Vec<Task>, pending: Vec<TaskKey>) -> Self {
+        let mut restored = BTreeMap::new();
+        for mut task in tasks {
+            if matches!(task.state, TaskState::Dispatched) {
+                task.state = TaskState::RecoveryPending;
+            }
+            restored.insert(task.key.clone(), task);
+        }
+        let mut queue = VecDeque::new();
+        let mut seen = BTreeSet::new();
+        for key in pending {
+            let queued = restored
+                .get(&key)
+                .is_some_and(|task| task.state == TaskState::Queued);
+            if queued && seen.insert(key.clone()) {
+                queue.push_back(key);
+            }
+        }
+        Self {
+            tasks: restored,
+            pending: queue,
+            in_flight: 0,
+            limits,
+        }
+    }
 }
 
 /// The only mutator of `Book` internals. Pure, deterministic, IO free.
@@ -49,14 +80,21 @@ impl Book {
 pub fn apply(book: &mut Book, event: Event) -> Step {
     match event {
         Event::Admit(request) => admit(book, request),
-        Event::Withdraw(key) => {
-            withdraw(book, &key);
-            Step {
+        Event::Withdraw(key) => withdraw(book, &key),
+        Event::Finished { key, done } => {
+            let mut step = finish(book, &key, done);
+            drain(book, &mut step.cmds);
+            step
+        }
+        Event::Settled { key, done } => finish(book, &key, done),
+        Event::Resume => {
+            let mut step = Step {
                 submission: None,
                 cmds: Vec::new(),
-            }
+            };
+            drain(book, &mut step.cmds);
+            step
         }
-        Event::Finished { key, done } => finish(book, &key, done),
     }
 }
 
@@ -92,16 +130,27 @@ fn admit(book: &mut Book, request: TaskRequest) -> Step {
     }
 }
 
-fn withdraw(book: &mut Book, key: &TaskKey) {
-    let queued = book
+fn withdraw(book: &mut Book, key: &TaskKey) -> Step {
+    let withdrawable = book
         .tasks
         .get(key)
-        .is_some_and(|task| task.state == TaskState::Queued);
-    if !queued {
-        return;
+        .is_some_and(|task| matches!(task.state, TaskState::Queued | TaskState::RecoveryPending));
+    if !withdrawable {
+        return Step {
+            submission: None,
+            cmds: Vec::new(),
+        };
     }
-    let _ = book.tasks.remove(key);
+    if let Some(task) = book.tasks.get_mut(key) {
+        task.state = TaskState::Withdrawn;
+    }
     book.pending.retain(|pending| pending != key);
+    let mut cmds = Vec::new();
+    drain(book, &mut cmds);
+    Step {
+        submission: None,
+        cmds,
+    }
 }
 
 fn finish(book: &mut Book, key: &TaskKey, done: Done) -> Step {
@@ -122,11 +171,9 @@ fn finish(book: &mut Book, key: &TaskKey, done: Done) -> Step {
         };
     }
     book.in_flight -= 1;
-    let mut cmds = Vec::new();
-    drain(book, &mut cmds);
     Step {
         submission: None,
-        cmds,
+        cmds: Vec::new(),
     }
 }
 
@@ -158,7 +205,11 @@ fn drain(book: &mut Book, cmds: &mut Vec<Cmd>) {
 }
 
 fn issue_busy(book: &Book, issue: &IssueId) -> bool {
-    book.tasks
-        .values()
-        .any(|task| &task.key.issue == issue && matches!(task.state, TaskState::Dispatched))
+    book.tasks.values().any(|task| {
+        &task.key.issue == issue
+            && matches!(
+                task.state,
+                TaskState::Dispatched | TaskState::RecoveryPending
+            )
+    })
 }

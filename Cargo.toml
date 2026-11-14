@@ -4,6 +4,7 @@ members = [
     "crates/kuroko-core",
     "crates/kuroko-engine",
     "crates/kuroko-linear",
+    "crates/kuroko-store",
     "crates/kuroko-transport",
 ]
 resolver = "3"
