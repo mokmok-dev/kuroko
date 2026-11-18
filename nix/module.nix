@@ -58,6 +58,12 @@ let
 
   oauthConfigured = missingOauthKeys == [ ];
 
+  # An operator who sets none of the four keeps the module exactly as it was, so
+  # "all unset" must satisfy the same assertion that "all set" does.
+  oauthUnset = lib.filterAttrs (_name: value: value != null) oauthKeys == { };
+
+  oauthConsistent = oauthConfigured || oauthUnset;
+
   oauthTableInSettings = cfg.settings ? linear && cfg.settings.linear ? oauth;
 
   credentials = lib.optionalAttrs oauthConfigured {
@@ -225,7 +231,7 @@ in
           + "a relative path resolves beside /etc/kuroko/config.toml";
       }
       {
-        assertion = oauthConfigured;
+        assertion = oauthConsistent;
         message =
           "services.kuroko.oauth is set partly; missing "
           + lib.concatMapStringsSep ", " (key: "services.kuroko.oauth.${key}") missingOauthKeys

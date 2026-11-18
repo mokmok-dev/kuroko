@@ -239,6 +239,33 @@
                 unitFile = pkgs.writeText "kuroko.service" unit;
                 oauthUnitFile = pkgs.writeText "kuroko-oauth.service" oauthUnit;
                 partialFile = pkgs.writeText "kuroko-partial-assertion" partialMessage;
+
+                # The path an existing operator is on: no oauth options at all.
+                # Its assertions must all hold, which the module check cannot prove
+                # by rendering the config alone, because a failed assertion is
+                # raised at `system.build.toplevel` and not at the etc file.
+                unsetAssertions =
+                  builtins.filter (entry: !entry.assertion)
+                    (nixosSystem {
+                      inherit system;
+                      modules = [
+                        kurokoModule
+                        {
+                          system.stateVersion = "24.11";
+                          services.kuroko = {
+                            enable = true;
+                            package = pkgs.writeShellScriptBin "kuroko" "exec true";
+                            settings = {
+                              linear.secret = "whsec_test";
+                              transport.stdio.command = "cat";
+                            };
+                          };
+                        }
+                      ];
+                    }).config.assertions;
+                unsetFile = pkgs.writeText "kuroko-unset-assertions" (
+                  builtins.concatStringsSep "\n" (map (entry: entry.message) unsetAssertions)
+                );
               in
               assert defaultPackage.meta.mainProgram == "kuroko";
               pkgs.runCommand "kuroko-module-check" { } ''
@@ -292,6 +319,11 @@
                 grep -q -- 'services.kuroko.oauth.installSecretFile' ${partialFile}
                 grep -q -- 'services.kuroko.oauth.redirectUri' ${partialFile}
                 absent ${partialFile} 'services.kuroko.oauth.clientId'
+
+                # An unset oauth block must satisfy every assertion, so no message
+                # mentions `services.kuroko.oauth`. A module that rejected the
+                # no-oauth case would break every existing operator.
+                absent ${unsetFile} 'services.kuroko.oauth'
 
                 touch $out
               '';
