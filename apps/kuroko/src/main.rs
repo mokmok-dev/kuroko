@@ -8,6 +8,7 @@ use std::sync::Arc;
 use kuroko::clock::SystemClock;
 use kuroko::config::{BootError, Config, DEFAULT_PATH};
 use kuroko::http::Http;
+use kuroko::linear::TokenProvider;
 use kuroko::router::{AppState, Oauth, router};
 use kuroko::transport::build_transport;
 use kuroko_core::{Book, Clock};
@@ -62,19 +63,37 @@ async fn run() -> Result<(), RunError> {
     );
     let engine = Arc::new(engine);
 
-    let state = AppState::new(gate, Arc::clone(&engine), clock)
+    let state = AppState::new(gate, Arc::clone(&engine), Arc::clone(&clock))
         .with_store(Arc::clone(&store) as Arc<dyn kuroko::router::Installations>);
     let state = match config.oauth {
         Some(oauth) => {
             let http = Http::new(HTTP_TIMEOUT).map_err(|source| RunError::Http {
                 source: source.to_string(),
             })?;
-            state.with_oauth(Oauth {
-                client: oauth.client,
-                install_secret: oauth.install_secret,
-                http: Arc::new(http),
-                states: StateStore::new(),
-            })
+            let http: Arc<dyn kuroko_linear::oauth::HttpPost> = Arc::new(http);
+            let installations = Arc::clone(&store) as Arc<dyn kuroko::router::Installations>;
+            // A cold start looks the workspace up by its most recent row, since
+            // there is no app user id to ask for yet.
+            let stored = store
+                .default_installation()
+                .map_err(RunError::Store)?
+                .map(kuroko::installations::restore);
+            let tokens = TokenProvider::new(
+                oauth.client.clone(),
+                Arc::clone(&http),
+                Arc::clone(&installations),
+                Arc::clone(&clock),
+                stored,
+            );
+            state
+                .with_store(installations)
+                .with_oauth(Oauth {
+                    client: oauth.client,
+                    install_secret: oauth.install_secret,
+                    http,
+                    states: StateStore::new(),
+                })
+                .with_tokens(Arc::new(tokens))
         }
         None => state,
     };

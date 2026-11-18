@@ -5,5 +5,6 @@ pub mod clock;
 pub mod config;
 pub mod http;
 pub mod installations;
+pub mod linear;
 pub mod router;
 pub mod transport;
