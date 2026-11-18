@@ -1,4 +1,7 @@
-//! The gate: HMAC, parse, freshness, distillation, prompt rendering.
+//! The gate: HMAC, parse, freshness, distillation, prompt rendering, and the
+//! types an OAuth install is made of.
+
+pub mod oauth;
 
 use hmac::{Hmac, KeyInit, Mac};
 use kuroko_core::{
