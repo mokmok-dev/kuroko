@@ -9,6 +9,7 @@ use kuroko_core::{
 };
 use kuroko_store::{Loaded, Store, StoreError, StoredInstallation};
 use rusqlite::Connection;
+use secrecy::SecretString;
 use tempfile::TempDir;
 
 // The version 1 schema as a released binary wrote it, so the migration test
@@ -133,8 +134,8 @@ impl Fixture {
 fn installation(app_user_id: &str, access_token: &str, installed_at: i64) -> StoredInstallation {
     StoredInstallation {
         app_user_id: app_user_id.to_owned(),
-        access_token: access_token.to_owned(),
-        refresh_token: Some(format!("refresh-{access_token}")),
+        access_token: SecretString::from(access_token),
+        refresh_token: Some(SecretString::from(format!("refresh-{access_token}"))),
         expires_at: 111,
         scope: "read,write".to_owned(),
         installed_at,
@@ -526,8 +527,8 @@ fn saving_an_installation_again_replaces_the_row() {
         .save_installation(&installation("user-1", "access-1", 100))
         .unwrap();
     let second = StoredInstallation {
-        access_token: "access-2".to_owned(),
-        refresh_token: Some("refresh-2".to_owned()),
+        access_token: SecretString::from("access-2"),
+        refresh_token: Some(SecretString::from("refresh-2")),
         expires_at: 222,
         scope: "read".to_owned(),
         installed_at: 200,
@@ -621,6 +622,44 @@ fn a_version_3_database_is_refused() {
     ));
 }
 
+/// `secrecy` withholds equality, so this impl is hand-written and needs its own
+/// pin. Each field is varied alone, so an `&&` swapped for `||` or dropped
+/// comparison shows up as a field that is no longer load-bearing.
+#[test]
+fn installation_equality_compares_every_field() {
+    let base = installation("user-1", "access-1", 100);
+
+    assert_eq!(base, installation("user-1", "access-1", 100));
+
+    let mut other = base.clone();
+    other.app_user_id = "user-2".to_owned();
+    assert_ne!(base, other, "app_user_id");
+
+    let mut other = base.clone();
+    other.access_token = SecretString::from("access-2");
+    assert_ne!(base, other, "access_token");
+
+    let mut other = base.clone();
+    other.refresh_token = Some(SecretString::from("refresh-other"));
+    assert_ne!(base, other, "refresh_token value");
+
+    let mut other = base.clone();
+    other.refresh_token = None;
+    assert_ne!(base, other, "refresh_token presence");
+
+    let mut other = base.clone();
+    other.expires_at = 999;
+    assert_ne!(base, other, "expires_at");
+
+    let mut other = base.clone();
+    other.scope = "read".to_owned();
+    assert_ne!(base, other, "scope");
+
+    let mut other = base.clone();
+    other.installed_at = 999;
+    assert_ne!(base, other, "installed_at");
+}
+
 #[test]
 fn the_installation_debug_redacts_both_tokens() {
     let saved = installation("user-1", "secret-access", 100);
@@ -628,11 +667,11 @@ fn the_installation_debug_redacts_both_tokens() {
     let printed = format!("{saved:?}");
 
     assert!(
-        printed.contains("access_token: \"[redacted]\""),
+        printed.contains("access_token: SecretBox<str>([REDACTED])"),
         "`{printed}`"
     );
     assert!(
-        printed.contains("refresh_token: Some(\"[redacted]\")"),
+        printed.contains("refresh_token: Some(SecretBox<str>([REDACTED]))"),
         "`{printed}`"
     );
     assert!(!printed.contains("secret-access"), "`{printed}`");

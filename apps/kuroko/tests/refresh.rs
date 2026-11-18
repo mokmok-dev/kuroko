@@ -14,7 +14,7 @@ use kuroko_core::{Book, Clock, Dispatch, Done, Journal, JournalError, Limits, Mi
 use kuroko_engine::{BoxFuture, Transport, spawn};
 use kuroko_linear::oauth::{
     BoxFuture as HttpFuture, HttpError, HttpPost, HttpResponse, Installation, OauthClient,
-    PostRequest, REFRESH_SKEW, Scopes, Secret, StateStore,
+    PostRequest, REFRESH_SKEW, Scopes, Secret, StateStore, Token,
 };
 use kuroko_linear::{Gate, PromptTemplate, TriggerConfig, WebhookSecret};
 use serde_json::Value;
@@ -179,8 +179,8 @@ fn answered(status: u16, body: &str) -> HttpResponse {
 fn installation() -> Installation {
     Installation {
         app_user_id: String::from("app-user-1"),
-        access_token: String::from(ACCESS),
-        refresh_token: Some(String::from(REFRESH_TOKEN)),
+        access_token: Token::new(ACCESS),
+        refresh_token: Some(Token::new(REFRESH_TOKEN)),
         expires_at: Millis(NOW.0 + 86_399_000),
         scopes: Scopes::parse("read write app:assignable"),
         installed_at: NOW,
@@ -242,7 +242,7 @@ async fn a_token_far_from_expiry_is_returned_without_a_refresh() {
 
     let pair = fixture.token().await.unwrap();
 
-    assert_eq!(pair.access_token, ACCESS);
+    assert_eq!(pair.access_token.expose(), ACCESS);
     assert_eq!(fixture.http.calls(), 0);
     assert_eq!(fixture.store.saves(), 0);
 }
@@ -254,8 +254,8 @@ async fn a_token_inside_the_skew_refreshes_once_and_is_reused_after() {
     let first = fixture.token().await.unwrap();
     let second = fixture.token().await.unwrap();
 
-    assert_eq!(first.access_token, REFRESHED_ACCESS);
-    assert_eq!(second.access_token, REFRESHED_ACCESS);
+    assert_eq!(first.access_token.expose(), REFRESHED_ACCESS);
+    assert_eq!(second.access_token.expose(), REFRESHED_ACCESS);
     assert_eq!(fixture.http.calls(), 1);
 }
 
@@ -273,8 +273,14 @@ async fn a_refresh_sends_the_rotated_form_and_persists_before_returning() {
     );
     assert_eq!(fixture.store.saves(), 1);
     let persisted = fixture.store.saved().unwrap();
-    assert_eq!(persisted.access_token, REFRESHED_ACCESS);
-    assert_eq!(persisted.refresh_token.as_deref(), Some("refresh-2"));
+    assert_eq!(persisted.access_token.expose(), REFRESHED_ACCESS);
+    assert_eq!(
+        persisted
+            .refresh_token
+            .map(|token| token.expose().to_owned())
+            .as_deref(),
+        Some("refresh-2")
+    );
     assert_eq!(persisted.expires_at, Millis(NOW.0 + 86_399_000));
 }
 
@@ -314,6 +320,8 @@ async fn ten_callers_inside_the_skew_share_one_refresh() {
             .unwrap()
             .unwrap()
             .access_token
+            .expose()
+            .to_owned()
     };
     assert_eq!(settle(owner).await, REFRESHED_ACCESS);
     for waiter in waiters {
@@ -352,7 +360,7 @@ async fn a_network_failure_leaves_the_old_pair_for_a_later_retry() {
     assert_eq!(fixture.store.saves(), 0);
 
     let retried = fixture.token().await.unwrap();
-    assert_eq!(retried.access_token, REFRESHED_ACCESS);
+    assert_eq!(retried.access_token.expose(), REFRESHED_ACCESS);
     assert_eq!(fixture.http.calls(), 2);
 }
 
@@ -391,8 +399,13 @@ async fn a_crash_right_after_a_refresh_restarts_with_the_new_pair() {
     );
     let pair = restarted.token().await.unwrap();
 
-    assert_eq!(pair.access_token, REFRESHED_ACCESS);
-    assert_eq!(pair.refresh_token.as_deref(), Some("refresh-2"));
+    assert_eq!(pair.access_token.expose(), REFRESHED_ACCESS);
+    assert_eq!(
+        pair.refresh_token
+            .map(|token| token.expose().to_owned())
+            .as_deref(),
+        Some("refresh-2")
+    );
     assert_eq!(restarted.http.calls(), 0);
 }
 
@@ -404,19 +417,19 @@ async fn an_expired_token_refreshes_rather_than_failing() {
 
     let pair = fixture.token().await.unwrap();
 
-    assert_eq!(pair.access_token, REFRESHED_ACCESS);
+    assert_eq!(pair.access_token.expose(), REFRESHED_ACCESS);
     assert_eq!(fixture.http.calls(), 1);
 }
 
 #[tokio::test]
 async fn a_clock_jump_past_the_expiry_refreshes_on_the_next_call() {
     let fixture = Provider::answering(installation(), vec![Ok(answered(200, REFRESHED))]);
-    assert_eq!(fixture.token().await.unwrap().access_token, ACCESS);
+    assert_eq!(fixture.token().await.unwrap().access_token.expose(), ACCESS);
 
     fixture.clock.advance(Millis(86_399_000));
 
     assert_eq!(
-        fixture.token().await.unwrap().access_token,
+        fixture.token().await.unwrap().access_token.expose(),
         REFRESHED_ACCESS
     );
     assert_eq!(fixture.http.calls(), 1);
@@ -447,7 +460,7 @@ async fn a_cancelled_refresh_leaves_the_next_caller_free_to_try() {
         .expect("a cancelled refresh must not wedge the provider")
         .unwrap();
 
-    assert_eq!(pair.access_token, REFRESHED_ACCESS);
+    assert_eq!(pair.access_token.expose(), REFRESHED_ACCESS);
 }
 
 #[tokio::test]

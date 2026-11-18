@@ -636,8 +636,14 @@ async fn a_successful_install_writes_one_row_and_names_the_app_user() {
 
     let installation = fixture.store.saved().unwrap();
     assert_eq!(installation.app_user_id, "app-user-1");
-    assert_eq!(installation.access_token, "access-1");
-    assert_eq!(installation.refresh_token.as_deref(), Some("refresh-1"));
+    assert_eq!(installation.access_token.expose(), "access-1");
+    assert_eq!(
+        installation
+            .refresh_token
+            .map(|token| token.expose().to_owned())
+            .as_deref(),
+        Some("refresh-1")
+    );
     assert_eq!(installation.expires_at, Millis(NOW.0 + 86_399_000));
     assert_eq!(installation.installed_at, NOW);
     assert_eq!(

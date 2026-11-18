@@ -426,7 +426,7 @@ fn an_oauth_config_never_prints_its_secrets() {
 
     assert!(!rendered.contains("secret-xyz"), "{rendered}");
     assert!(!rendered.contains("install-1"), "{rendered}");
-    assert!(rendered.contains("[redacted]"), "{rendered}");
+    assert!(rendered.contains("[REDACTED]"), "{rendered}");
 }
 
 #[test]

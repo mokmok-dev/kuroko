@@ -13,6 +13,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use form_urlencoded::Serializer;
 use kuroko_core::Millis;
 use rand::RngCore;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -52,17 +53,50 @@ pub const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 /// [`Scopes::parse`] reads.
 pub const AGENT_SCOPES: &str = "read write app:assignable app:mentionable";
 
+/// A credential Linear issued, redacted when printed and compared by value.
+///
+/// The `Debug` comes from `SecretString`, so no struct holding one needs a
+/// hand-written formatter and a field added later cannot leak by omission.
+/// `PartialEq` is written here because `secrecy` withholds it: existing code
+/// compares a refresh slot and the tests compare parsed answers, and neither is
+/// an authentication decision that a variable-time compare could weaken.
+#[derive(Clone, Debug)]
+pub struct Token(SecretString);
+
+impl Token {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(SecretString::from(value.into()))
+    }
+
+    /// The credential itself, which belongs only in a request body or header.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl PartialEq for Token {
+    fn eq(&self, other: &Self) -> bool {
+        self.expose() == other.expose()
+    }
+}
+
+impl Eq for Token {}
+
 /// A value that must never reach a log line, a rendered config, or a `Debug`.
 ///
 /// Deliberately not `PartialEq`: [`Secret::matches`] is the only comparison, so a
-/// caller cannot reach for `==` and compare the bytes in variable time.
-#[derive(Clone)]
-pub struct Secret(String);
+/// caller cannot reach for `==` and compare the bytes in variable time. The inner
+/// `SecretString` owns the `Debug` redaction, so adding a field to a type that
+/// holds one cannot leak by omission.
+#[derive(Clone, Debug)]
+pub struct Secret(SecretString);
 
 impl Secret {
     #[must_use]
     pub fn new(secret: impl Into<String>) -> Self {
-        Self(secret.into())
+        Self(SecretString::from(secret.into()))
     }
 
     /// Reports whether `candidate` is this secret.
@@ -72,15 +106,9 @@ impl Secret {
     /// secret's length.
     #[must_use]
     pub fn matches(&self, candidate: &str) -> bool {
-        let expected = Sha256::digest(self.0.as_bytes());
+        let expected = Sha256::digest(self.0.expose_secret().as_bytes());
         let provided = Sha256::digest(candidate.as_bytes());
         expected.as_slice().ct_eq(provided.as_slice()).into()
-    }
-}
-
-impl fmt::Debug for Secret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[redacted]")
     }
 }
 
@@ -160,7 +188,7 @@ impl OauthClient {
         form.append_pair("code", code);
         form.append_pair("redirect_uri", &self.redirect_uri);
         form.append_pair("client_id", &self.client_id);
-        form.append_pair("client_secret", &self.client_secret.0);
+        form.append_pair("client_secret", self.client_secret.0.expose_secret());
         form.append_pair("grant_type", "authorization_code");
         form.finish()
     }
@@ -206,7 +234,7 @@ impl OauthClient {
         form.append_pair("grant_type", "refresh_token");
         form.append_pair("refresh_token", refresh_token);
         form.append_pair("client_id", &self.client_id);
-        form.append_pair("client_secret", &self.client_secret.0);
+        form.append_pair("client_secret", self.client_secret.0.expose_secret());
         form.finish()
     }
 
@@ -310,32 +338,17 @@ fn parse_viewer(raw: &[u8]) -> Result<String, InstallError> {
 }
 
 /// One workspace installation, ready to persist.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// `SecretString` owns the `Debug` redaction for both tokens, so the type needs
+/// no hand-written formatter and a field added later cannot leak by omission.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Installation {
     pub app_user_id: String,
-    pub access_token: String,
-    pub refresh_token: Option<String>,
+    pub access_token: Token,
+    pub refresh_token: Option<Token>,
     pub expires_at: Millis,
     pub scopes: Scopes,
     pub installed_at: Millis,
-}
-
-impl fmt::Debug for Installation {
-    // Redacted by hand: a derived `Debug` would print the tokens the moment an
-    // error or a log line touches an installation.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Installation")
-            .field("app_user_id", &self.app_user_id)
-            .field("access_token", &"[redacted]")
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_ref().map(|_| "[redacted]"),
-            )
-            .field("expires_at", &self.expires_at)
-            .field("scopes", &self.scopes)
-            .field("installed_at", &self.installed_at)
-            .finish()
-    }
 }
 
 impl Installation {
@@ -411,7 +424,7 @@ pub async fn complete_install(
     now: Millis,
 ) -> Result<Installation, InstallError> {
     let token = client.exchange(http, code).await?;
-    let app_user_id = client.viewer_id(http, &token.access_token).await?;
+    let app_user_id = client.viewer_id(http, token.access_token.expose()).await?;
     Ok(Installation {
         app_user_id,
         access_token: token.access_token,
@@ -657,8 +670,8 @@ impl StateToken {
 /// What Linear's token endpoint hands back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenResponse {
-    pub access_token: String,
-    pub refresh_token: Option<String>,
+    pub access_token: Token,
+    pub refresh_token: Option<Token>,
     /// Lifetime in seconds, as Linear sends it.
     pub expires_in: u64,
     pub scopes: Scopes,
@@ -693,11 +706,11 @@ impl TokenResponse {
             .and_then(Value::as_u64)
             .ok_or(TokenError::MissingField("expires_in"))?;
         Ok(Self {
-            access_token: access_token.to_owned(),
+            access_token: Token::new(access_token.to_owned()),
             refresh_token: body
                 .get("refresh_token")
                 .and_then(Value::as_str)
-                .map(str::to_owned),
+                .map(|token| Token::new(token.to_owned())),
             expires_in,
             scopes: parse_scope_field(body.get("scope")),
         })
