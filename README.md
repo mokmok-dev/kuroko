@@ -119,6 +119,12 @@ database written by a newer binary is refused at boot rather than migrated downw
 does not decode aborts the boot and the error names its `(source, issue, trigger)` key; silently
 skipping it would lose an admission record.
 
+The workspace's OAuth installation lives in the same database, in `linear_installation`, keyed by
+`app_user_id` and upserted on each refresh. Keeping the token here rather than in a separate file
+gives credentials and the ledger one durability story: one file to back up, one lock, one set of
+WAL and `synchronous=FULL` guarantees. The file therefore holds a live credential, so treat it like
+one: `chmod 600`, and keep backups private.
+
 `Withdrawn` is a tombstone, not a deletion. Every key stays in the database so a webhook
 redelivered after a restart is still a duplicate. Tombstones and terminal rows are retained for
 the life of the store, which is what makes admission idempotent and keeps results auditable. The
