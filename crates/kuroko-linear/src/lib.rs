@@ -2,6 +2,7 @@
 //! types an OAuth install is made of.
 
 pub mod oauth;
+pub mod token;
 
 use hmac::{Hmac, KeyInit, Mac};
 use kuroko_core::{

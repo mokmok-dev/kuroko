@@ -17,7 +17,10 @@ use kuroko_linear::oauth::{
 };
 use kuroko_linear::{Gate, Intake, Rejection};
 use serde::Deserialize;
+use serde::Serialize;
 use tokio::time::timeout;
+
+use crate::linear::{TokenFailure, TokenProvider};
 
 /// Linear gives up after five seconds, so a wedged engine must not spend that budget.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -37,6 +40,9 @@ pub struct AppState {
     /// The installations `AppState` writes through, absent in a build that took
     /// no store.
     pub store: Option<Arc<dyn Installations>>,
+    /// The access token a later Linear call presents. Absent until an OAuth app
+    /// is registered, the same condition as [`AppState::oauth`].
+    pub tokens: Option<Arc<TokenProvider>>,
 }
 
 /// Everything the install routes need, present only when `[linear.oauth]` is.
@@ -76,6 +82,7 @@ impl AppState {
             clock,
             oauth: None,
             store: None,
+            tokens: None,
         }
     }
 
@@ -90,6 +97,12 @@ impl AppState {
         self.store = Some(store);
         self
     }
+
+    #[must_use]
+    pub fn with_tokens(mut self, tokens: Arc<TokenProvider>) -> Self {
+        self.tokens = Some(tokens);
+        self
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -98,6 +111,7 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks", get(tasks))
         .route("/linear/install", get(install))
         .route("/linear/oauth/callback", get(callback))
+        .route("/linear/installation", get(installation))
         .with_state(state)
 }
 
@@ -171,6 +185,59 @@ async fn tasks(State(state): State<AppState>) -> Result<Json<Vec<Task>>, StatusC
 fn rejection_status(rejection: Rejection) -> StatusCode {
     // `Rejection::status` owns the mapping; every value it returns is a valid status.
     StatusCode::from_u16(rejection.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// What `/linear/installation` reports: which workspace, what was granted, and
+/// how long the token lasts. Deliberately not derived from [`Installation`],
+/// which carries both tokens; a field added there cannot leak through here.
+#[derive(Debug, Serialize)]
+struct InstallationView {
+    app_user_id: String,
+    scopes: Vec<String>,
+    /// Whole seconds, never negative, so the operator sees the lifetime rather
+    /// than having to subtract an absolute instant from a clock they do not share.
+    expires_in: u64,
+}
+
+/// Reports the installation without ever reporting a token.
+async fn installation(State(state): State<AppState>) -> Response {
+    let Some(tokens) = state.tokens.as_ref() else {
+        return page(
+            StatusCode::NOT_FOUND,
+            "OAuth is not configured in kuroko.toml.",
+        );
+    };
+    let now = state.clock.now_ms();
+    match tokens.access_token().await {
+        // Asked of the provider rather than answered from a copy, so this route
+        // also proves the stored pair still produces a usable token.
+        Ok(live) => {
+            let expires_in = live.remaining_seconds(now);
+            Json(InstallationView {
+                app_user_id: live.app_user_id,
+                scopes: live.scopes.tokens().map(str::to_owned).collect(),
+                expires_in,
+            })
+            .into_response()
+        }
+        Err(failure) => installation_failure(&failure),
+    }
+}
+
+/// The status an operator can act on: install again, or retry a transient fault.
+fn installation_failure(failure: &TokenFailure) -> Response {
+    match failure {
+        TokenFailure::NotInstalled | TokenFailure::Withdrawn | TokenFailure::NoRefreshToken => {
+            page(
+                StatusCode::CONFLICT,
+                "kuroko is not installed in this workspace. Run the install flow at `/linear/install`.",
+            )
+        }
+        TokenFailure::Transient(detail) | TokenFailure::NotSaved(detail) => page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("The Linear installation is not usable right now: {detail}"),
+        ),
+    }
 }
 
 /// The query parameters `/linear/install` accepts.
@@ -266,6 +333,11 @@ async fn callback(State(state): State<AppState>, Query(query): Query<CallbackQue
             StatusCode::INTERNAL_SERVER_ERROR,
             "kuroko could not save the installation.",
         );
+    }
+    // After the save, so the provider never hands out a pair the store does not
+    // hold. This is what clears a withdrawn grant.
+    if let Some(tokens) = state.tokens.as_ref() {
+        tokens.adopt(installation.clone());
     }
     log::info!("installed as app user {}", installation.app_user_id);
     page(

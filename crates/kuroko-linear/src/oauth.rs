@@ -34,6 +34,16 @@ const VIEWER_BODY: &str = r#"{"query":"query Me { viewer { id } }"}"#;
 /// How long a browser has to come back from Linear before its state expires.
 pub const INSTALL_STATE_TTL: Millis = Millis(600_000);
 
+/// How much of an access token's life is treated as already spent.
+///
+/// Five minutes, as Linear's own examples use. A token is renewed this long
+/// before it expires, so a call that starts inside the window cannot outlive it.
+pub const REFRESH_SKEW: Millis = Millis(300_000);
+
+/// The one refusal Linear sends when a refresh token was already used or
+/// withdrawn, which no retry can fix.
+const INVALID_GRANT: &str = "invalid_grant";
+
 /// Both install requests get this long before the route gives up, well inside a
 /// browser's patience for a page that never loads.
 pub const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
@@ -189,6 +199,62 @@ impl OauthClient {
         TokenResponse::parse(&response.body).map_err(InstallError::Token)
     }
 
+    /// The form body Linear's token endpoint expects to rotate `refresh_token`.
+    #[must_use]
+    pub fn refresh_body(&self, refresh_token: &str) -> String {
+        let mut form = Serializer::new(String::new());
+        form.append_pair("grant_type", "refresh_token");
+        form.append_pair("refresh_token", refresh_token);
+        form.append_pair("client_id", &self.client_id);
+        form.append_pair("client_secret", &self.client_secret.0);
+        form.finish()
+    }
+
+    /// Trades `refresh_token` for a fresh pair.
+    ///
+    /// Linear rotates the refresh token on every use, so a failure is split by
+    /// whether another attempt could work: only [`RefreshError::Revoked`] means
+    /// the credential itself is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RefreshError::Revoked`] when Linear answers `invalid_grant`, and
+    /// [`RefreshError::Transient`] for a transport failure or any other refusal.
+    pub async fn refresh(
+        &self,
+        http: &dyn HttpPost,
+        refresh_token: &str,
+    ) -> Result<TokenResponse, RefreshError> {
+        let body = self.refresh_body(refresh_token);
+        let response = http
+            .post(PostRequest {
+                url: TOKEN_URL,
+                content_type: FORM_CONTENT_TYPE,
+                authorization: None,
+                body: body.as_bytes(),
+            })
+            .await
+            .map_err(|error| RefreshError::Transient(error.to_string()))?;
+        let refused = !(200..300).contains(&response.status);
+        match TokenResponse::parse(&response.body) {
+            // A refused status wins over a body that happens to parse as a grant.
+            Ok(token) if !refused => Ok(token),
+            Ok(_) => Err(RefreshError::Transient(format!(
+                "the token endpoint answered with status {}",
+                response.status
+            ))),
+            // A withdrawn grant is named in the body whatever the status, and it
+            // is the one refusal a retry can only make worse.
+            Err(TokenError::Rejected { error, .. }) if error == INVALID_GRANT => {
+                Err(RefreshError::Revoked)
+            }
+            Err(error) => Err(RefreshError::Transient(format!(
+                "the token endpoint answered with status {}: {error}",
+                response.status
+            ))),
+        }
+    }
+
     /// Reads the app user id Linear assigned this workspace.
     ///
     /// # Errors
@@ -271,6 +337,66 @@ impl fmt::Debug for Installation {
             .finish()
     }
 }
+
+impl Installation {
+    /// The pair Linear handed back after `token`, with the fields a refresh does
+    /// not replace carried over.
+    ///
+    /// A refresh answer may omit the rotated refresh token and the granted
+    /// scopes. Keeping the stored ones is the only safe reading of an omission,
+    /// since the grant did not change and dropping the refresh token would leave
+    /// the installation unusable when the new access token expires.
+    #[must_use]
+    pub fn renew(&self, token: &TokenResponse, now: Millis) -> Self {
+        Self {
+            app_user_id: self.app_user_id.clone(),
+            access_token: token.access_token.clone(),
+            refresh_token: token
+                .refresh_token
+                .clone()
+                .or_else(|| self.refresh_token.clone()),
+            expires_at: expires_at(now, token.expires_in),
+            scopes: if token.scopes.is_empty() {
+                self.scopes.clone()
+            } else {
+                token.scopes.clone()
+            },
+            installed_at: self.installed_at,
+        }
+    }
+
+    /// Whole seconds of usable life left at `now`, floored at zero.
+    #[must_use]
+    pub fn remaining_seconds(&self, now: Millis) -> u64 {
+        let left = self.expires_at.0.saturating_sub(now.0);
+        u64::try_from(left).map_or(0, |millis| millis / 1_000)
+    }
+}
+
+/// Why a refresh did not produce a new pair.
+///
+/// Split by whether another attempt could work, which is what the caller needs
+/// to decide between dropping the credential and keeping it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefreshError {
+    /// Linear withdrew the refresh token, either because it expired unused or
+    /// because a rotated one was presented twice. No retry can recover it.
+    Revoked,
+    /// The exchange did not finish. The old pair may still work, and a later
+    /// attempt may succeed.
+    Transient(String),
+}
+
+impl fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Revoked => f.write_str("Linear withdrew the refresh token"),
+            Self::Transient(detail) => write!(f, "the token refresh failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for RefreshError {}
 
 /// Runs the whole callback exchange: code to token, then token to app user id.
 ///
@@ -430,6 +556,19 @@ impl Scopes {
                 .map(OauthScope::from_token)
                 .collect(),
         )
+    }
+
+    /// Reports whether no scope was granted, which is how an answer that omits
+    /// the field reads.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The granted scopes in the order Linear sent them, each as the token it
+    /// was received as.
+    pub fn tokens(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(OauthScope::token)
     }
 }
 
