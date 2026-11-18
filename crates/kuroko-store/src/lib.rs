@@ -1,4 +1,5 @@
-//! SQLite persistence for the task book: schema, migrations, and the journal port.
+//! SQLite persistence: the task book and the Linear installation, with schema,
+//! migrations, and the journal port.
 
 use std::fmt;
 use std::path::Path;
