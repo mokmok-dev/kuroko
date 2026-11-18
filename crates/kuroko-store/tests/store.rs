@@ -7,9 +7,36 @@ use kuroko_core::{
     Book, DelegateId, Done, Event, FailureReason, IssueId, Journal, LabelName, Limits, Millis,
     Outcome, Source, Submission, TaskKey, TaskRequest, TaskSpec, TaskState, TriggerId, apply,
 };
-use kuroko_store::{Loaded, Store, StoreError};
+use kuroko_store::{Loaded, Store, StoreError, StoredInstallation};
 use rusqlite::Connection;
 use tempfile::TempDir;
+
+// The version 1 schema as a released binary wrote it, so the migration test
+// opens a database this build never created.
+const SCHEMA_V1: &str = "
+CREATE TABLE tasks (
+    source TEXT NOT NULL,
+    issue TEXT NOT NULL,
+    trigger TEXT NOT NULL,
+    identifier TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    url TEXT,
+    prompt TEXT NOT NULL,
+    state TEXT NOT NULL,
+    done TEXT,
+    PRIMARY KEY (source, issue, trigger)
+);
+
+CREATE TABLE pending (
+    source TEXT NOT NULL,
+    issue TEXT NOT NULL,
+    trigger TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (source, issue, trigger),
+    FOREIGN KEY (source, issue, trigger) REFERENCES tasks (source, issue, trigger) ON DELETE CASCADE
+);
+";
 
 const fn limits(in_flight: usize, max_queued: usize) -> Limits {
     Limits {
@@ -100,6 +127,17 @@ impl Fixture {
 
     fn raw(&self) -> Connection {
         Connection::open(&self.path).unwrap()
+    }
+}
+
+fn installation(app_user_id: &str, access_token: &str, installed_at: i64) -> StoredInstallation {
+    StoredInstallation {
+        app_user_id: app_user_id.to_owned(),
+        access_token: access_token.to_owned(),
+        refresh_token: Some(format!("refresh-{access_token}")),
+        expires_at: 111,
+        scope: "read,write".to_owned(),
+        installed_at,
     }
 }
 
@@ -294,7 +332,7 @@ fn a_newer_schema_is_refused() {
         error,
         StoreError::NewerSchema {
             found: 999,
-            supported: 1
+            supported: 2
         }
     ));
 }
@@ -444,4 +482,172 @@ fn an_in_memory_store_round_trips() {
 
     assert_eq!(loaded.tasks.len(), 2);
     assert_eq!(loaded.pending, vec![queued]);
+}
+
+#[test]
+fn an_installation_round_trips_after_reopen() {
+    let fixture = Fixture::new();
+    let saved = installation("user-1", "access-1", 100);
+    let store = fixture.store();
+    store.save_installation(&saved).unwrap();
+    drop(store);
+
+    let loaded = fixture.store().load_installation("user-1").unwrap();
+
+    assert_eq!(loaded, Some(saved));
+}
+
+#[test]
+fn an_installation_without_a_refresh_token_round_trips_as_none() {
+    let store = Store::open_in_memory().unwrap();
+    let saved = StoredInstallation {
+        refresh_token: None,
+        ..installation("user-1", "access-1", 100)
+    };
+    store.save_installation(&saved).unwrap();
+
+    let loaded = store.load_installation("user-1").unwrap();
+
+    assert_eq!(loaded, Some(saved));
+}
+
+#[test]
+fn an_unknown_installation_is_none() {
+    let store = Store::open_in_memory().unwrap();
+
+    assert_eq!(store.load_installation("nobody").unwrap(), None);
+}
+
+#[test]
+fn saving_an_installation_again_replaces_the_row() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    store
+        .save_installation(&installation("user-1", "access-1", 100))
+        .unwrap();
+    let second = StoredInstallation {
+        access_token: "access-2".to_owned(),
+        refresh_token: Some("refresh-2".to_owned()),
+        expires_at: 222,
+        scope: "read".to_owned(),
+        installed_at: 200,
+        ..installation("user-1", "access-1", 100)
+    };
+    store.save_installation(&second).unwrap();
+
+    let loaded = store.load_installation("user-1").unwrap();
+    let raw = fixture.raw();
+    let rows: i64 = raw
+        .query_row("SELECT COUNT(*) FROM linear_installation", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    assert_eq!(loaded, Some(second));
+    assert_eq!(rows, 1);
+}
+
+#[test]
+fn the_default_installation_is_the_newest() {
+    let store = Store::open_in_memory().unwrap();
+    let older = installation("user-1", "access-1", 100);
+    let newer = installation("user-2", "access-2", 200);
+    // Inserted oldest-first, so only the ordering by `installed_at` picks the newer row.
+    store.save_installation(&older).unwrap();
+    store.save_installation(&newer).unwrap();
+
+    assert_eq!(store.default_installation().unwrap(), Some(newer));
+}
+
+#[test]
+fn no_installation_has_a_default() {
+    let store = Store::open_in_memory().unwrap();
+
+    assert_eq!(store.default_installation().unwrap(), None);
+}
+
+#[test]
+fn a_version_1_database_migrates_with_its_tasks_intact() {
+    let fixture = Fixture::new();
+    let key = label("issue-a", "kuroko");
+
+    let raw = fixture.raw();
+    raw.execute_batch(SCHEMA_V1).unwrap();
+    raw.execute_batch(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);
+         INSERT INTO schema_version (version) VALUES (1);
+         INSERT INTO tasks (source, issue, trigger, identifier, title, description, url, prompt, state, done)
+         VALUES ('linear', 'issue-a', 'label:kuroko', 'ISSUE-A', 'title issue-a', NULL, NULL, 'work on issue-a', 'queued', NULL);
+         INSERT INTO pending (source, issue, trigger, position)
+         VALUES ('linear', 'issue-a', 'label:kuroko', 0);",
+    )
+    .unwrap();
+    drop(raw);
+
+    let store = fixture.store();
+
+    let loaded = store.load().unwrap();
+    let version: i64 = fixture
+        .raw()
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    store
+        .save_installation(&installation("user-1", "access-1", 100))
+        .unwrap();
+    assert_eq!(version, 2);
+    assert_eq!(state(&loaded, &key), Some(&TaskState::Queued));
+    assert_eq!(loaded.pending, vec![key]);
+}
+
+#[test]
+fn a_version_3_database_is_refused() {
+    let fixture = Fixture::new();
+    let raw = fixture.raw();
+    raw.execute_batch(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);
+         INSERT INTO schema_version (version) VALUES (3);",
+    )
+    .unwrap();
+    drop(raw);
+
+    let error = Store::open(&fixture.path).unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::NewerSchema {
+            found: 3,
+            supported: 2
+        }
+    ));
+}
+
+#[test]
+fn the_installation_debug_redacts_both_tokens() {
+    let saved = installation("user-1", "secret-access", 100);
+
+    let printed = format!("{saved:?}");
+
+    assert!(
+        printed.contains("access_token: \"[redacted]\""),
+        "`{printed}`"
+    );
+    assert!(
+        printed.contains("refresh_token: Some(\"[redacted]\")"),
+        "`{printed}`"
+    );
+    assert!(!printed.contains("secret-access"), "`{printed}`");
+    assert!(!printed.contains("refresh-secret-access"), "`{printed}`");
+    assert!(printed.contains("user-1"), "`{printed}`");
+}
+
+#[test]
+fn an_absent_refresh_token_prints_as_none() {
+    let saved = StoredInstallation {
+        refresh_token: None,
+        ..installation("user-1", "secret-access", 100)
+    };
+
+    let printed = format!("{saved:?}");
+
+    assert!(printed.contains("refresh_token: None"), "`{printed}`");
 }

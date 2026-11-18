@@ -1,4 +1,5 @@
-//! SQLite persistence for the task book: schema, migrations, and the journal port.
+//! SQLite persistence: the task book and the Linear installation, with schema,
+//! migrations, and the journal port.
 
 use std::fmt;
 use std::path::Path;
@@ -11,7 +12,7 @@ use kuroko_core::{
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 // Must stay below the webhook submit timeout, so a busy lock fails the request
 // instead of committing after the caller has already received 503.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(1_000);
@@ -41,11 +42,56 @@ CREATE TABLE pending (
 );
 ";
 
+const SCHEMA_V2: &str = "
+CREATE TABLE linear_installation (
+    app_user_id TEXT PRIMARY KEY,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT,
+    expires_at INTEGER NOT NULL,
+    scope TEXT NOT NULL,
+    installed_at INTEGER NOT NULL
+);
+";
+
 /// The rows a restart hands to [`kuroko_core::Book::reconcile`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Loaded {
     pub tasks: Vec<Task>,
     pub pending: Vec<TaskKey>,
+}
+
+const REDACTED: &str = "[redacted]";
+
+/// One Linear OAuth installation as SQLite holds it.
+///
+/// Local to this crate so that persistence does not depend on the Linear client;
+/// the caller converts to its own type.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StoredInstallation {
+    pub app_user_id: String,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: i64,
+    pub scope: String,
+    pub installed_at: i64,
+}
+
+impl fmt::Debug for StoredInstallation {
+    // Redacted by hand: a derived `Debug` would print both tokens into any log
+    // line or error that touches an installation.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredInstallation")
+            .field("app_user_id", &self.app_user_id)
+            .field("access_token", &REDACTED)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| REDACTED),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("scope", &self.scope)
+            .field("installed_at", &self.installed_at)
+            .finish()
+    }
 }
 
 /// A SQLite-backed journal.
@@ -190,6 +236,85 @@ impl Store {
         Ok(())
     }
 
+    /// Stores the installation, replacing the row for the same `app_user_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the transaction fails; the previous row stays
+    /// visible because SQLite rolls the whole transaction back.
+    pub fn save_installation(&self, installation: &StoredInstallation) -> Result<(), StoreError> {
+        let mut connection = self.lock()?;
+        // DEFERRED upgrades a read to a writer after the fact, which can surface
+        // SQLITE_BUSY without the busy handler retrying the upgrade.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO linear_installation \
+             (app_user_id, access_token, refresh_token, expires_at, scope, installed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (app_user_id) DO UPDATE SET \
+                 access_token = excluded.access_token, \
+                 refresh_token = excluded.refresh_token, \
+                 expires_at = excluded.expires_at, \
+                 scope = excluded.scope, \
+                 installed_at = excluded.installed_at",
+            params![
+                installation.app_user_id,
+                installation.access_token,
+                installation.refresh_token,
+                installation.expires_at,
+                installation.scope,
+                installation.installed_at,
+            ],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        Ok(())
+    }
+
+    /// Loads the installation for `app_user_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn load_installation(
+        &self,
+        app_user_id: &str,
+    ) -> Result<Option<StoredInstallation>, StoreError> {
+        let connection = self.lock()?;
+        let installation = connection
+            .query_row(
+                "SELECT app_user_id, access_token, refresh_token, expires_at, scope, installed_at \
+                 FROM linear_installation WHERE app_user_id = ?1",
+                [app_user_id],
+                decode_installation,
+            )
+            .optional()?;
+        drop(connection);
+        Ok(installation)
+    }
+
+    /// Loads the most recently installed row.
+    ///
+    /// A cold start has no app user id to look up, so this is how it finds the
+    /// workspace the daemon was installed into.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the query fails.
+    pub fn default_installation(&self) -> Result<Option<StoredInstallation>, StoreError> {
+        let connection = self.lock()?;
+        let installation = connection
+            .query_row(
+                "SELECT app_user_id, access_token, refresh_token, expires_at, scope, installed_at \
+                 FROM linear_installation ORDER BY installed_at DESC LIMIT 1",
+                [],
+                decode_installation,
+            )
+            .optional()?;
+        drop(connection);
+        Ok(installation)
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
         self.connection.lock().map_err(|_| StoreError::Poisoned)
     }
@@ -278,6 +403,10 @@ fn migrate(connection: &mut Connection, target: i64) -> Result<(), StoreError> {
         apply_migration(connection, 1, SCHEMA_V1)?;
         version = 1;
     }
+    if version < 2 {
+        apply_migration(connection, 2, SCHEMA_V2)?;
+        version = 2;
+    }
     if version != target {
         return Err(StoreError::Refused(format!(
             "no migration from schema version {version} to {target}"
@@ -355,6 +484,17 @@ const fn state_tag(state: &TaskState) -> &'static str {
         TaskState::Failed(_) => "failed",
         TaskState::Withdrawn => "withdrawn",
     }
+}
+
+fn decode_installation(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredInstallation> {
+    Ok(StoredInstallation {
+        app_user_id: row.get(0)?,
+        access_token: row.get(1)?,
+        refresh_token: row.get(2)?,
+        expires_at: row.get(3)?,
+        scope: row.get(4)?,
+        installed_at: row.get(5)?,
+    })
 }
 
 fn done_json(state: &TaskState) -> Result<Option<String>, StoreError> {
