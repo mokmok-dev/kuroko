@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use hmac::{Hmac, KeyInit, Mac};
-use kuroko::config::{Config, TransportChoice};
+use kuroko::config::{Config, EnvOverrides, TransportChoice};
 use kuroko_core::{Millis, TaskSpec};
 use kuroko_linear::{Gate, Intake};
 use serde_json::json;
@@ -27,7 +27,9 @@ command = "cat"
 }
 
 fn error(text: &str) -> String {
-    Config::from_toml(text, None).unwrap_err().to_string()
+    Config::from_toml(text, &EnvOverrides::default())
+        .unwrap_err()
+        .to_string()
 }
 
 fn sign(secret: &str, body: &[u8]) -> String {
@@ -68,7 +70,7 @@ fn admits(config: &Config, secret: &str) -> bool {
 
 #[test]
 fn the_defaults_match_the_documented_ones() {
-    let config = Config::from_toml(&minimal(), None).unwrap();
+    let config = Config::from_toml(&minimal(), &EnvOverrides::default()).unwrap();
 
     assert_eq!(
         config.bind,
@@ -102,7 +104,14 @@ fn the_defaults_match_the_documented_ones() {
 
 #[test]
 fn the_environment_secret_overrides_the_file() {
-    let config = Config::from_toml(&minimal(), Some("whsec_env")).unwrap();
+    let config = Config::from_toml(
+        &minimal(),
+        &EnvOverrides {
+            webhook_secret: Some(String::from("whsec_env")),
+            ..EnvOverrides::default()
+        },
+    )
+    .unwrap();
 
     assert!(admits(&config, "whsec_env"));
     assert!(!admits(&config, SECRET));
@@ -110,7 +119,14 @@ fn the_environment_secret_overrides_the_file() {
 
 #[test]
 fn an_empty_environment_secret_keeps_the_file_secret() {
-    let config = Config::from_toml(&minimal(), Some("")).unwrap();
+    let config = Config::from_toml(
+        &minimal(),
+        &EnvOverrides {
+            webhook_secret: Some(String::new()),
+            ..EnvOverrides::default()
+        },
+    )
+    .unwrap();
 
     assert!(admits(&config, SECRET));
 }
@@ -127,7 +143,7 @@ url = "wss://agent.example/ws"
 timeout_secs = 30
 "#
     );
-    let config = Config::from_toml(&text, None).unwrap();
+    let config = Config::from_toml(&text, &EnvOverrides::default()).unwrap();
 
     assert_eq!(
         config.transport,
@@ -203,7 +219,7 @@ fn a_store_path_can_be_configured() {
         "{}\n[store]\npath = \"/var/lib/kuroko/tasks.db\"\n",
         minimal()
     );
-    let config = Config::from_toml(&text, None).unwrap();
+    let config = Config::from_toml(&text, &EnvOverrides::default()).unwrap();
 
     assert_eq!(config.store, PathBuf::from("/var/lib/kuroko/tasks.db"));
 }
@@ -265,4 +281,150 @@ fn an_unparsable_bind_is_a_boot_error() {
         "{}",
         error(&text)
     );
+}
+
+const OAUTH: &str = r#"
+[linear.oauth]
+client_id = "client-abc"
+client_secret = "secret-xyz"
+redirect_uri = "https://kuroko.example/linear/oauth/callback"
+install_secret = "install-1"
+"#;
+
+#[test]
+fn an_absent_oauth_table_leaves_oauth_unset() {
+    let config = Config::from_toml(&minimal(), &EnvOverrides::default()).unwrap();
+
+    assert!(config.oauth.is_none());
+}
+
+#[test]
+fn a_full_oauth_table_is_accepted() {
+    let text = format!("{}{OAUTH}", minimal());
+    let config = Config::from_toml(&text, &EnvOverrides::default()).unwrap();
+    let oauth = config.oauth.unwrap();
+
+    assert_eq!(oauth.client.client_id, "client-abc");
+    assert_eq!(
+        oauth.client.redirect_uri,
+        "https://kuroko.example/linear/oauth/callback"
+    );
+    assert!(oauth.client.client_secret.matches("secret-xyz"));
+    assert!(oauth.install_secret.matches("install-1"));
+}
+
+#[test]
+fn a_partial_oauth_table_names_every_missing_key() {
+    let text = format!(
+        "{}\n[linear.oauth]\nclient_id = \"client-abc\"\n",
+        minimal()
+    );
+    let message = error(&text);
+    let missing = message.split("; missing ").nth(1).unwrap_or_default();
+
+    for key in ["client_secret", "redirect_uri", "install_secret"] {
+        assert!(missing.contains(key), "{key} missing from {message}");
+    }
+    assert!(!missing.contains("client_id"), "{message}");
+}
+
+#[test]
+fn a_partial_oauth_table_does_not_name_the_keys_it_has() {
+    let text = format!(
+        "{}\n[linear.oauth]\nclient_id = \"c\"\nclient_secret = \"s\"\nredirect_uri = \"https://x.example/cb\"\n",
+        minimal()
+    );
+    let message = error(&text);
+    let missing = message.split("; missing ").nth(1).unwrap_or_default();
+
+    assert_eq!(missing, "install_secret", "{message}");
+}
+
+#[test]
+fn an_empty_oauth_value_counts_as_missing() {
+    let text =
+        format!("{}{OAUTH}", minimal()).replace("client_id = \"client-abc\"", "client_id = \"\"");
+    let message = error(&text);
+    let missing = message.split("; missing ").nth(1).unwrap_or_default();
+
+    assert_eq!(missing, "client_id", "{message}");
+}
+
+#[test]
+fn the_environment_client_secret_overrides_the_file() {
+    let text = format!("{}{OAUTH}", minimal());
+    let env = EnvOverrides {
+        client_secret: Some(String::from("env-secret")),
+        ..EnvOverrides::default()
+    };
+    let config = Config::from_toml(&text, &env).unwrap();
+    let oauth = config.oauth.unwrap();
+
+    assert!(oauth.client.client_secret.matches("env-secret"));
+    assert!(!oauth.client.client_secret.matches("secret-xyz"));
+}
+
+#[test]
+fn an_empty_environment_client_secret_keeps_the_file_value() {
+    let text = format!("{}{OAUTH}", minimal());
+    let env = EnvOverrides {
+        client_secret: Some(String::new()),
+        ..EnvOverrides::default()
+    };
+    let config = Config::from_toml(&text, &env).unwrap();
+
+    assert!(
+        config
+            .oauth
+            .unwrap()
+            .client
+            .client_secret
+            .matches("secret-xyz")
+    );
+}
+
+#[test]
+fn the_environment_client_secret_cannot_invent_a_partial_table() {
+    let text = format!(
+        "{}\n[linear.oauth]\nclient_id = \"client-abc\"\n",
+        minimal()
+    );
+    let env = EnvOverrides {
+        client_secret: Some(String::from("env-secret")),
+        ..EnvOverrides::default()
+    };
+    let message = Config::from_toml(&text, &env).unwrap_err().to_string();
+
+    assert!(message.contains("redirect_uri"), "{message}");
+    assert!(message.contains("install_secret"), "{message}");
+}
+
+#[test]
+fn an_unknown_oauth_key_is_a_boot_error() {
+    let text = format!("{}{OAUTH}client_uri = \"x\"\n", minimal());
+
+    assert!(error(&text).contains("client_uri"), "{}", error(&text));
+}
+
+#[test]
+fn an_oauth_redirect_uri_must_be_a_url() {
+    let text = format!("{}{OAUTH}", minimal())
+        .replace("https://kuroko.example/linear/oauth/callback", "kuroko");
+
+    assert!(
+        error(&text).contains("must start with http:// or https://"),
+        "{}",
+        error(&text)
+    );
+}
+
+#[test]
+fn an_oauth_config_never_prints_its_secrets() {
+    let text = format!("{}{OAUTH}", minimal());
+    let config = Config::from_toml(&text, &EnvOverrides::default()).unwrap();
+    let rendered = format!("{:?}", config.oauth.unwrap());
+
+    assert!(!rendered.contains("secret-xyz"), "{rendered}");
+    assert!(!rendered.contains("install-1"), "{rendered}");
+    assert!(rendered.contains("[redacted]"), "{rendered}");
 }
