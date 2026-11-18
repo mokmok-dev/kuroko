@@ -93,7 +93,7 @@ impl TokenProvider {
         };
         match self
             .client
-            .refresh(self.http.as_ref(), &refresh_token)
+            .refresh(self.http.as_ref(), refresh_token.expose())
             .await
         {
             Ok(token) => {

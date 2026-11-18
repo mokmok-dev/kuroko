@@ -11,6 +11,7 @@ use kuroko_core::{
     TaskSpec, TaskState, TriggerId,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use secrecy::{ExposeSecret, SecretString};
 
 const SCHEMA_VERSION: i64 = 2;
 // Must stay below the webhook submit timeout, so a busy lock fails the request
@@ -60,39 +61,40 @@ pub struct Loaded {
     pub pending: Vec<TaskKey>,
 }
 
-const REDACTED: &str = "[redacted]";
-
 /// One Linear OAuth installation as SQLite holds it.
 ///
 /// Local to this crate so that persistence does not depend on the Linear client;
-/// the caller converts to its own type.
-#[derive(Clone, PartialEq, Eq)]
+/// the caller converts to its own type. `SecretString` owns the `Debug`
+/// redaction, so a field added later cannot leak by omission.
+#[derive(Clone, Debug)]
 pub struct StoredInstallation {
     pub app_user_id: String,
-    pub access_token: String,
-    pub refresh_token: Option<String>,
+    pub access_token: SecretString,
+    pub refresh_token: Option<SecretString>,
     pub expires_at: i64,
     pub scope: String,
     pub installed_at: i64,
 }
 
-impl fmt::Debug for StoredInstallation {
-    // Redacted by hand: a derived `Debug` would print both tokens into any log
-    // line or error that touches an installation.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StoredInstallation")
-            .field("app_user_id", &self.app_user_id)
-            .field("access_token", &REDACTED)
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_ref().map(|_| REDACTED),
-            )
-            .field("expires_at", &self.expires_at)
-            .field("scope", &self.scope)
-            .field("installed_at", &self.installed_at)
-            .finish()
+impl PartialEq for StoredInstallation {
+    // `secrecy` withholds `PartialEq` so a secret is never compared by accident.
+    // These two are compared by tests and by the save round trip, never to
+    // decide whether a caller may authenticate, so comparing the bytes is safe.
+    fn eq(&self, other: &Self) -> bool {
+        self.app_user_id == other.app_user_id
+            && self.access_token.expose_secret() == other.access_token.expose_secret()
+            && self.refresh_token.as_ref().map(ExposeSecret::expose_secret)
+                == other
+                    .refresh_token
+                    .as_ref()
+                    .map(ExposeSecret::expose_secret)
+            && self.expires_at == other.expires_at
+            && self.scope == other.scope
+            && self.installed_at == other.installed_at
     }
 }
+
+impl Eq for StoredInstallation {}
 
 /// A SQLite-backed journal.
 #[derive(Debug)]
@@ -259,8 +261,11 @@ impl Store {
                  installed_at = excluded.installed_at",
             params![
                 installation.app_user_id,
-                installation.access_token,
-                installation.refresh_token,
+                installation.access_token.expose_secret(),
+                installation
+                    .refresh_token
+                    .as_ref()
+                    .map(ExposeSecret::expose_secret),
                 installation.expires_at,
                 installation.scope,
                 installation.installed_at,
@@ -487,10 +492,12 @@ const fn state_tag(state: &TaskState) -> &'static str {
 }
 
 fn decode_installation(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredInstallation> {
+    let access_token: String = row.get(1)?;
+    let refresh_token: Option<String> = row.get(2)?;
     Ok(StoredInstallation {
         app_user_id: row.get(0)?,
-        access_token: row.get(1)?,
-        refresh_token: row.get(2)?,
+        access_token: SecretString::from(access_token),
+        refresh_token: refresh_token.map(SecretString::from),
         expires_at: row.get(3)?,
         scope: row.get(4)?,
         installed_at: row.get(5)?,

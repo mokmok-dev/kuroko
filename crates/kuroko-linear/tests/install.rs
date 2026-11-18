@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use kuroko_core::Millis;
 use kuroko_linear::oauth::{
     HttpError, HttpPost, HttpResponse, INSTALL_STATE_TTL, InstallError, Installation, OauthClient,
-    PostRequest, Scopes, Secret, StateStore, StateToken, TokenError, TokenResponse,
+    PostRequest, Scopes, Secret, StateStore, StateToken, Token, TokenError, TokenResponse,
     complete_install,
 };
 use rand::RngCore;
@@ -118,11 +118,20 @@ fn a_secret_matches_only_itself() {
     assert!(!secret.matches("secret-xy"));
 }
 
+/// `secrecy` withholds equality, so this impl is hand-written and needs its own
+/// pin: a constant `true` would otherwise pass every existing assertion.
+#[test]
+fn tokens_compare_by_their_value() {
+    assert_eq!(Token::new("access-1"), Token::new("access-1"));
+    assert_ne!(Token::new("access-1"), Token::new("access-2"));
+    assert_ne!(Token::new("access-1"), Token::new("access-11"));
+}
+
 #[test]
 fn a_secret_never_prints_its_value() {
     let rendered = format!("{:?}", Secret::new(CLIENT_SECRET));
 
-    assert_eq!(rendered, "[redacted]");
+    assert_eq!(rendered, "Secret(SecretBox<str>([REDACTED]))");
     assert!(!rendered.contains(CLIENT_SECRET));
 }
 
@@ -166,8 +175,14 @@ async fn an_exchange_posts_a_form_and_parses_the_grant() {
     let http = Stub::answering(vec![Ok(http_answer(TOKEN_OK))]);
     let token = client().exchange(&http, CODE).await.unwrap();
 
-    assert_eq!(token.access_token, "access-1");
-    assert_eq!(token.refresh_token.as_deref(), Some("refresh-1"));
+    assert_eq!(token.access_token.expose(), "access-1");
+    assert_eq!(
+        token
+            .refresh_token
+            .map(|token| token.expose().to_owned())
+            .as_deref(),
+        Some("refresh-1")
+    );
     assert_eq!(token.scopes.to_string(), "read,app:assignable");
 
     let seen = http.seen();
@@ -319,8 +334,8 @@ async fn a_complete_install_carries_both_tokens_and_the_expiry() {
         installation,
         Installation {
             app_user_id: String::from("app-user-1"),
-            access_token: String::from("access-1"),
-            refresh_token: Some(String::from("refresh-1")),
+            access_token: Token::new("access-1"),
+            refresh_token: Some(Token::new("refresh-1")),
             expires_at: Millis(NOW.0 + 86_399_000),
             scopes: Scopes::parse("read app:assignable"),
             installed_at: NOW,
@@ -344,8 +359,8 @@ async fn a_complete_install_stops_before_the_viewer_when_the_token_fails() {
 fn an_installation_never_prints_its_tokens() {
     let installation = Installation {
         app_user_id: String::from("app-user-1"),
-        access_token: String::from("access-1"),
-        refresh_token: Some(String::from("refresh-1")),
+        access_token: Token::new("access-1"),
+        refresh_token: Some(Token::new("refresh-1")),
         expires_at: NOW,
         scopes: Scopes::default(),
         installed_at: NOW,
@@ -355,7 +370,7 @@ fn an_installation_never_prints_its_tokens() {
     assert!(rendered.contains("app-user-1"), "{rendered}");
     assert!(!rendered.contains("access-1"), "{rendered}");
     assert!(!rendered.contains("refresh-1"), "{rendered}");
-    assert!(rendered.contains("[redacted]"), "{rendered}");
+    assert!(rendered.contains("[REDACTED]"), "{rendered}");
 }
 
 /// The token endpoint's own answer is the one holder of a token that a derived
@@ -376,7 +391,7 @@ fn a_token_response_never_prints_its_tokens() {
 fn an_installation_without_a_refresh_token_redacts_as_absent() {
     let installation = Installation {
         app_user_id: String::from("app-user-1"),
-        access_token: String::from("access-1"),
+        access_token: Token::new("access-1"),
         refresh_token: None,
         expires_at: NOW,
         scopes: Scopes::default(),

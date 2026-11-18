@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use kuroko_core::Millis;
 use kuroko_linear::oauth::{
     HttpError, HttpPost, HttpResponse, Installation, OauthClient, PostRequest, REFRESH_SKEW,
-    RefreshError, Scopes, Secret, TokenResponse,
+    RefreshError, Scopes, Secret, Token, TokenResponse,
 };
 use kuroko_linear::token::{Slot, Step};
 
@@ -79,8 +79,8 @@ fn answered(status: u16, body: &str) -> HttpResponse {
 fn installation() -> Installation {
     Installation {
         app_user_id: String::from("app-user-1"),
-        access_token: String::from("access-1"),
-        refresh_token: Some(String::from(REFRESH_TOKEN)),
+        access_token: Token::new("access-1"),
+        refresh_token: Some(Token::new(REFRESH_TOKEN)),
         expires_at: Millis(NOW.0 + 86_399_000),
         scopes: Scopes::parse("read write app:assignable"),
         installed_at: NOW,
@@ -117,8 +117,14 @@ async fn a_refresh_posts_the_form_and_parses_the_new_pair() {
     let http = Stub::answering(vec![Ok(answered(200, REFRESHED))]);
     let token = client().refresh(&http, REFRESH_TOKEN).await.unwrap();
 
-    assert_eq!(token.access_token, "access-2");
-    assert_eq!(token.refresh_token.as_deref(), Some("refresh-2"));
+    assert_eq!(token.access_token.expose(), "access-2");
+    assert_eq!(
+        token
+            .refresh_token
+            .map(|token| token.expose().to_owned())
+            .as_deref(),
+        Some("refresh-2")
+    );
     assert_eq!(token.expires_in, LIFETIME);
     assert_eq!(token.scopes.to_string(), "read,write");
 
@@ -195,8 +201,14 @@ fn a_renewed_pair_takes_the_new_tokens_and_the_new_expiry() {
     let renewed = expiring().renew(&token, later);
 
     assert_eq!(renewed.app_user_id, "app-user-1");
-    assert_eq!(renewed.access_token, "access-2");
-    assert_eq!(renewed.refresh_token.as_deref(), Some("refresh-2"));
+    assert_eq!(renewed.access_token.expose(), "access-2");
+    assert_eq!(
+        renewed
+            .refresh_token
+            .map(|token| token.expose().to_owned())
+            .as_deref(),
+        Some("refresh-2")
+    );
     assert_eq!(renewed.expires_at, Millis(later.0 + 86_399_000));
     assert_eq!(renewed.scopes.to_string(), "read,write");
     assert_eq!(renewed.installed_at, NOW);
@@ -208,7 +220,13 @@ fn a_renewal_that_omits_the_refresh_token_keeps_the_stored_one() {
 
     let renewed = installation().renew(&token, NOW);
 
-    assert_eq!(renewed.refresh_token.as_deref(), Some(REFRESH_TOKEN));
+    assert_eq!(
+        renewed
+            .refresh_token
+            .map(|token| token.expose().to_owned())
+            .as_deref(),
+        Some(REFRESH_TOKEN)
+    );
 }
 
 #[test]

@@ -174,8 +174,14 @@ fn token_json_with_a_refresh_token() {
     )
     .unwrap();
 
-    assert_eq!(token.access_token, "access-1");
-    assert_eq!(token.refresh_token.as_deref(), Some("refresh-1"));
+    assert_eq!(token.access_token.expose(), "access-1");
+    assert_eq!(
+        token
+            .refresh_token
+            .map(|token| token.expose().to_owned())
+            .as_deref(),
+        Some("refresh-1")
+    );
     assert_eq!(token.expires_in, 86_399);
     assert_eq!(
         token.scopes.to_string(),
