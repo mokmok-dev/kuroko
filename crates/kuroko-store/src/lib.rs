@@ -60,6 +60,8 @@ pub struct Loaded {
     pub pending: Vec<TaskKey>,
 }
 
+const REDACTED: &str = "[redacted]";
+
 /// One Linear OAuth installation as SQLite holds it.
 ///
 /// Local to this crate so that persistence does not depend on the Linear client;
@@ -73,8 +75,6 @@ pub struct StoredInstallation {
     pub scope: String,
     pub installed_at: i64,
 }
-
-const REDACTED: &str = "[redacted]";
 
 impl fmt::Debug for StoredInstallation {
     // Redacted by hand: a derived `Debug` would print both tokens into any log
