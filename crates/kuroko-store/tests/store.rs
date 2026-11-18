@@ -552,8 +552,9 @@ fn the_default_installation_is_the_newest() {
     let store = Store::open_in_memory().unwrap();
     let older = installation("user-1", "access-1", 100);
     let newer = installation("user-2", "access-2", 200);
-    store.save_installation(&newer).unwrap();
+    // Inserted oldest-first, so only the ordering by `installed_at` picks the newer row.
     store.save_installation(&older).unwrap();
+    store.save_installation(&newer).unwrap();
 
     assert_eq!(store.default_installation().unwrap(), Some(newer));
 }
