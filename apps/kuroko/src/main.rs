@@ -7,11 +7,13 @@ use std::sync::Arc;
 
 use kuroko::clock::SystemClock;
 use kuroko::config::{BootError, Config, DEFAULT_PATH};
-use kuroko::router::{AppState, router};
+use kuroko::http::Http;
+use kuroko::router::{AppState, Oauth, router};
 use kuroko::transport::build_transport;
 use kuroko_core::{Book, Clock};
 use kuroko_engine::{EngineError, spawn};
 use kuroko_linear::Gate;
+use kuroko_linear::oauth::{HTTP_TIMEOUT, StateStore};
 use kuroko_store::Store;
 use tokio::net::TcpListener;
 
@@ -30,7 +32,7 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), RunError> {
     let path = config_path()?;
     let config = Config::load(&path)?;
-    let store = Store::open(&config.store).map_err(RunError::Store)?;
+    let store = Arc::new(Store::open(&config.store).map_err(RunError::Store)?);
     let loaded = store.load().map_err(RunError::Store)?;
     let book = Book::reconcile(config.limits, loaded.tasks, loaded.pending);
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -52,14 +54,32 @@ async fn run() -> Result<(), RunError> {
         })?;
     log::info!("listening on {}", config.bind);
 
-    let (engine, mut engine_task) = spawn(transport, book, Arc::clone(&clock), Arc::new(store));
+    let (engine, mut engine_task) = spawn(
+        transport,
+        book,
+        Arc::clone(&clock),
+        Arc::clone(&store) as Arc<dyn kuroko_core::Journal>,
+    );
     let engine = Arc::new(engine);
 
-    let server = axum::serve(
-        listener,
-        router(AppState::new(gate, Arc::clone(&engine), clock)),
-    )
-    .with_graceful_shutdown(shutdown_signal());
+    let state = AppState::new(gate, Arc::clone(&engine), clock)
+        .with_store(Arc::clone(&store) as Arc<dyn kuroko::router::Installations>);
+    let state = match config.oauth {
+        Some(oauth) => {
+            let http = Http::new(HTTP_TIMEOUT).map_err(|source| RunError::Http {
+                source: source.to_string(),
+            })?;
+            state.with_oauth(Oauth {
+                client: oauth.client,
+                install_secret: oauth.install_secret,
+                http: Arc::new(http),
+                states: StateStore::new(),
+            })
+        }
+        None => state,
+    };
+
+    let server = axum::serve(listener, router(state)).with_graceful_shutdown(shutdown_signal());
 
     tokio::select! {
         result = server => {
@@ -132,6 +152,9 @@ enum RunError {
     Boot(BootError),
     Store(kuroko_store::StoreError),
     Engine(String),
+    Http {
+        source: String,
+    },
     Bind {
         addr: SocketAddr,
         source: std::io::Error,
@@ -146,6 +169,7 @@ impl std::fmt::Display for RunError {
             Self::Boot(error) => write!(f, "{error}"),
             Self::Store(error) => write!(f, "cannot initialise the task store: {error}"),
             Self::Engine(message) => write!(f, "the engine stopped: {message}"),
+            Self::Http { source } => write!(f, "cannot build the HTTP client: {source}"),
             Self::Bind { addr, source } => write!(f, "cannot bind {addr}: {source}"),
             Self::Serve(source) => write!(f, "cannot serve: {source}"),
         }

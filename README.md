@@ -47,6 +47,36 @@ reason. `[server] bind` defaults to `127.0.0.1:8787`, `[linear] replay_window_se
 store is opened and loaded before the HTTP listener binds, so a database that cannot be opened
 stops the daemon instead of accepting deliveries it cannot persist.
 
+## Install the app over OAuth
+
+Register an application in Linear's settings with the callback URL
+`https://your-host:8787/linear/oauth/callback`, then add its registration:
+
+```toml
+[linear.oauth]
+client_id = "from_linear"
+client_secret = "from_linear"
+redirect_uri = "https://your-host:8787/linear/oauth/callback"
+install_secret = "a_value_only_the_operator_knows"
+```
+
+All four keys are required together, and a partial table stops the daemon at boot naming every key
+it is missing. The table is optional: without it the webhook path works exactly as before and both
+install routes answer `404`. `KUROKO_LINEAR_CLIENT_SECRET` overrides `client_secret` when it is set
+to a non-empty value, which is how you keep the secret out of the TOML.
+
+Then open `/linear/install` with the install secret, as `Authorization: Bearer <install_secret>` or
+as `?install_secret=<install_secret>`. The daemon answers a wrong or missing secret with `401`,
+otherwise it redirects to Linear with a single-use state token that lives ten minutes. Linear
+sends the browser back to the callback, which exchanges the code, reads the workspace's app user
+id, and stores the installation in `linear_installation`. The state is consumed before the
+exchange, so a replayed callback gets `401` and cannot overwrite a saved row. Each HTTP call gives
+up after four seconds and fails the install without writing a row.
+
+The install secret and the client secret never appear in a log line or a `Debug` rendering, and
+neither is ever echoed to the browser. A restart mid-install leaves the state set empty, which is a
+failed install the operator simply starts again.
+
 ## NixOS
 
 The flake exports `nixosModules.default`, which renders the config and runs the daemon as a
@@ -82,7 +112,8 @@ unit.
 
 Put `KUROKO_LINEAR_SECRET=whsec_...` in the file named by `environmentFile`, readable only by
 root. Setting `settings.linear.secret` instead puts the secret in the world-readable Nix store,
-and the module warns about it.
+and the module warns about it. The same applies to `KUROKO_LINEAR_CLIENT_SECRET` and to
+`install_secret`: environment or a credentials file, never the rendered config.
 
 ## Point Linear at it
 
@@ -90,6 +121,8 @@ Create a webhook in Linear settings with the URL `http://your-host:8787/webhooks
 the "Issues" resource type. Copy the signing secret into `[linear] secret`. An issue is dispatched
 when it is delegated to an agent and `[trigger] any_delegate` is true, or when it carries one of
 `[trigger] label_names`. Linear needs a route to the daemon, so use a tunnel or a reachable host.
+Alternatively, install the app over OAuth as described above, which is what records the workspace
+credential kuroko uses to talk back to Linear.
 
 ## Task list
 
