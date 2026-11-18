@@ -5,7 +5,8 @@ use std::sync::Mutex;
 use kuroko_core::Millis;
 use kuroko_linear::oauth::{
     HttpError, HttpPost, HttpResponse, INSTALL_STATE_TTL, InstallError, Installation, OauthClient,
-    PostRequest, Scopes, Secret, StateStore, StateToken, TokenError, complete_install,
+    PostRequest, Scopes, Secret, StateStore, StateToken, TokenError, TokenResponse,
+    complete_install,
 };
 use rand::RngCore;
 
@@ -355,6 +356,20 @@ fn an_installation_never_prints_its_tokens() {
     assert!(!rendered.contains("access-1"), "{rendered}");
     assert!(!rendered.contains("refresh-1"), "{rendered}");
     assert!(rendered.contains("[redacted]"), "{rendered}");
+}
+
+/// The token endpoint's own answer is the one holder of a token that a derived
+/// `Debug` still prints. It is not logged today, and this pins it so a later log
+/// line cannot spill a credential.
+#[test]
+fn a_token_response_never_prints_its_tokens() {
+    let raw = br#"{"access_token":"access-1","refresh_token":"refresh-1","expires_in":86399,"scope":"read write"}"#;
+    let response = TokenResponse::parse(raw).unwrap();
+    let rendered = format!("{response:?}");
+
+    assert!(!rendered.contains("access-1"), "{rendered}");
+    assert!(!rendered.contains("refresh-1"), "{rendered}");
+    assert!(rendered.contains("86399"), "{rendered}");
 }
 
 #[test]
