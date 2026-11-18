@@ -145,6 +145,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bit-set"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -725,12 +731,16 @@ dependencies = [
 name = "kuroko-linear"
 version = "2026.11.1"
 dependencies = [
+ "base64",
+ "form_urlencoded",
  "hex",
  "hmac",
  "kuroko-core",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
 ]
 
 [[package]]
