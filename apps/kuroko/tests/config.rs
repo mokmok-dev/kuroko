@@ -428,3 +428,43 @@ fn an_oauth_config_never_prints_its_secrets() {
     assert!(!rendered.contains("install-1"), "{rendered}");
     assert!(rendered.contains("[redacted]"), "{rendered}");
 }
+
+#[test]
+fn the_environment_install_secret_overrides_the_file() {
+    let text = format!("{}{OAUTH}", minimal());
+    let env = EnvOverrides {
+        install_secret: Some(String::from("env-install")),
+        ..EnvOverrides::default()
+    };
+    let oauth = Config::from_toml(&text, &env).unwrap().oauth.unwrap();
+
+    assert!(oauth.install_secret.matches("env-install"));
+    assert!(!oauth.install_secret.matches("install-1"));
+}
+
+#[test]
+fn the_environment_install_secret_cannot_invent_a_partial_table() {
+    let text = format!(
+        "{}\n[linear.oauth]\nclient_id = \"client-abc\"\n",
+        minimal()
+    );
+    let env = EnvOverrides {
+        install_secret: Some(String::from("env-install")),
+        ..EnvOverrides::default()
+    };
+    let message = Config::from_toml(&text, &env).unwrap_err().to_string();
+
+    assert!(message.contains("client_secret"), "{message}");
+}
+
+#[test]
+fn an_empty_environment_install_secret_keeps_the_file_value() {
+    let text = format!("{}{OAUTH}", minimal());
+    let env = EnvOverrides {
+        install_secret: Some(String::new()),
+        ..EnvOverrides::default()
+    };
+    let oauth = Config::from_toml(&text, &env).unwrap().oauth.unwrap();
+
+    assert!(oauth.install_secret.matches("install-1"));
+}

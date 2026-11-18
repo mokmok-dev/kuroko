@@ -19,6 +19,17 @@ pub const SECRET_ENV: &str = "KUROKO_LINEAR_SECRET";
 /// Overrides `[linear.oauth] client_secret` when it is set to a non-empty value.
 pub const CLIENT_SECRET_ENV: &str = "KUROKO_LINEAR_CLIENT_SECRET";
 
+/// Overrides `[linear.oauth] install_secret` when it is set to a non-empty value.
+pub const INSTALL_SECRET_ENV: &str = "KUROKO_LINEAR_INSTALL_SECRET";
+
+/// Names a file holding `[linear.oauth] client_secret`, read when the value
+/// variable is unset or empty.
+pub const CLIENT_SECRET_FILE_ENV: &str = "KUROKO_LINEAR_CLIENT_SECRET_FILE";
+
+/// Names a file holding `[linear.oauth] install_secret`, read when the value
+/// variable is unset or empty.
+pub const INSTALL_SECRET_FILE_ENV: &str = "KUROKO_LINEAR_INSTALL_SECRET_FILE";
+
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_STORE_PATH: &str = "kuroko.db";
 const DEFAULT_TEMPLATE: &str = "Issue {identifier}: {title}\n\n{description}\n{url}";
@@ -47,7 +58,7 @@ pub struct Config {
 ///
 /// `client_secret` and `install_secret` are [`Secret`], which renders as
 /// `[redacted]`, so neither reaches a log line or a rendered config. Feed them
-/// from `KUROKO_LINEAR_CLIENT_SECRET` or a systemd `LoadCredential` file rather
+/// from `KUROKO_LINEAR_CLIENT_SECRET` or one of the `_FILE` variables rather
 /// than the TOML, which the NixOS module writes to the world-readable store.
 #[derive(Clone, Debug)]
 pub struct OauthConfig {
@@ -104,7 +115,7 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        let mut config = Self::from_toml(&text, &EnvOverrides::from_environment())?;
+        let mut config = Self::from_toml(&text, &EnvOverrides::from_environment()?)?;
         // A relative store path belongs beside the config, so a launch from another
         // working directory does not scatter the database and its WAL files.
         if config.store.is_relative()
@@ -127,20 +138,58 @@ impl Config {
 }
 
 /// The environment values a test can inject instead of mutating the process.
+///
+/// Every secret is already resolved to its value here, so [`Config::from_toml`]
+/// stays a pure function of text and values and the filesystem is read once, at
+/// boot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EnvOverrides {
     pub webhook_secret: Option<String>,
     pub client_secret: Option<String>,
+    pub install_secret: Option<String>,
 }
 
 impl EnvOverrides {
-    #[must_use]
-    pub fn from_environment() -> Self {
-        Self {
+    /// Reads the process environment, including the files the `_FILE` variables
+    /// name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BootError::Read`] when a named file cannot be read, so a unit
+    /// whose `LoadCredential` path is wrong stops at boot instead of starting
+    /// without the secret.
+    pub fn from_environment() -> Result<Self, BootError> {
+        let client_file = std::env::var_os(CLIENT_SECRET_FILE_ENV).map(PathBuf::from);
+        let install_file = std::env::var_os(INSTALL_SECRET_FILE_ENV).map(PathBuf::from);
+        let client_value = std::env::var(CLIENT_SECRET_ENV).ok();
+        let install_value = std::env::var(INSTALL_SECRET_ENV).ok();
+        Ok(Self {
             webhook_secret: std::env::var(SECRET_ENV).ok(),
-            client_secret: std::env::var(CLIENT_SECRET_ENV).ok(),
-        }
+            client_secret: secret_override(client_value.as_deref(), client_file.as_deref())?,
+            install_secret: secret_override(install_value.as_deref(), install_file.as_deref())?,
+        })
     }
+}
+
+/// The value variable if it holds something, otherwise the file the `_FILE`
+/// variable names.
+///
+/// The value wins when it is non-empty, so an operator can override a stale
+/// credential without editing the unit. A trailing newline is not part of a
+/// secret, and both `echo` and a hand-written credential file can add one. An
+/// empty file counts as unset, which leaves the TOML value in charge.
+fn secret_override(value: Option<&str>, file: Option<&Path>) -> Result<Option<String>, BootError> {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        return Ok(Some(value.to_owned()));
+    }
+    let Some(path) = file else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(path).map_err(|source| BootError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(Some(text.trim_end().to_owned()).filter(|value| !value.is_empty()))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -374,6 +423,12 @@ impl OauthSection {
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
             .or(client_secret);
+        let install_secret = env
+            .install_secret
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or(install_secret);
         let keys = [
             ("client_id", client_id.as_deref()),
             ("client_secret", client_secret.as_deref()),
@@ -461,4 +516,66 @@ fn seconds(value: Option<u64>, name: &str) -> Result<Duration, BootError> {
 
 const fn invalid(message: String) -> BootError {
     BootError::Invalid(message)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::path::Path;
+
+    use super::secret_override;
+
+    #[test]
+    fn the_value_wins_over_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secret");
+        std::fs::write(&file, "from-file").unwrap();
+
+        let resolved = secret_override(Some("from-value"), Some(&file)).unwrap();
+
+        assert_eq!(resolved.as_deref(), Some("from-value"));
+    }
+
+    #[test]
+    fn an_empty_value_falls_back_to_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secret");
+        std::fs::write(&file, "from-file\n").unwrap();
+
+        assert_eq!(
+            secret_override(Some(""), Some(&file)).unwrap().as_deref(),
+            Some("from-file")
+        );
+        assert_eq!(
+            secret_override(None, Some(&file)).unwrap().as_deref(),
+            Some("from-file")
+        );
+    }
+
+    #[test]
+    fn neither_a_value_nor_a_file_resolves_to_nothing() {
+        assert_eq!(secret_override(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn an_empty_file_resolves_to_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secret");
+        std::fs::write(&file, "\n").unwrap();
+
+        assert_eq!(secret_override(None, Some(&file)).unwrap(), None);
+    }
+
+    #[test]
+    fn an_unreadable_file_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent");
+
+        let message = secret_override(None, Some(Path::new(&missing)))
+            .unwrap_err()
+            .to_string();
+
+        assert!(message.contains("absent"), "{message}");
+    }
 }
