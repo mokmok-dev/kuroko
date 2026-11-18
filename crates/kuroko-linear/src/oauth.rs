@@ -1,21 +1,378 @@
-//! Wire types and pure functions for installing the app over OAuth.
+//! Wire types and the two HTTP calls for installing the app over OAuth.
 //!
 //! Linear answers the token endpoint with the scopes it granted, so the install
 //! flow keeps whatever it sends: a scope this build does not know is carried
 //! through rather than dropped.
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use form_urlencoded::Serializer;
 use kuroko_core::Millis;
 use rand::RngCore;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 /// 32 bytes of entropy, which base64url without padding renders as 43
 /// characters.
 const STATE_BYTES: usize = 32;
+
+const AUTHORIZE_BASE: &str = "https://linear.app/oauth/authorize";
+const TOKEN_URL: &str = "https://api.linear.app/oauth/token";
+const GRAPHQL_URL: &str = "https://api.linear.app/graphql";
+const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
+const JSON_CONTENT_TYPE: &str = "application/json";
+
+/// `viewer.id` is the app user Linear creates for the installation in this
+/// workspace, so it is the id the row is keyed by.
+const VIEWER_BODY: &str = r#"{"query":"query Me { viewer { id } }"}"#;
+
+/// How long a browser has to come back from Linear before its state expires.
+pub const INSTALL_STATE_TTL: Millis = Millis(600_000);
+
+/// Both install requests get this long before the route gives up, well inside a
+/// browser's patience for a page that never loads.
+pub const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// The scopes an agent installation asks for, in the space separated form
+/// [`Scopes::parse`] reads.
+pub const AGENT_SCOPES: &str = "read write app:assignable app:mentionable";
+
+/// A value that must never reach a log line, a rendered config, or a `Debug`.
+///
+/// Deliberately not `PartialEq`: [`Secret::matches`] is the only comparison, so a
+/// caller cannot reach for `==` and compare the bytes in variable time.
+#[derive(Clone)]
+pub struct Secret(String);
+
+impl Secret {
+    #[must_use]
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self(secret.into())
+    }
+
+    /// Reports whether `candidate` is this secret.
+    ///
+    /// Both sides are hashed to a fixed width first, so a wrong length costs the
+    /// same comparison as a wrong byte and the timing says nothing about the
+    /// secret's length.
+    #[must_use]
+    pub fn matches(&self, candidate: &str) -> bool {
+        let expected = Sha256::digest(self.0.as_bytes());
+        let provided = Sha256::digest(candidate.as_bytes());
+        expected.as_slice().ct_eq(provided.as_slice()).into()
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+/// A POST body the install flow needs sent.
+#[derive(Clone, Copy, Debug)]
+pub struct PostRequest<'a> {
+    pub url: &'a str,
+    pub content_type: &'a str,
+    /// The whole `Authorization` header value, when the call needs one.
+    pub authorization: Option<&'a str>,
+    pub body: &'a [u8],
+}
+
+/// A response, as much of it as the install reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+/// Why a POST never produced a response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HttpError {
+    /// The request outlived [`HTTP_TIMEOUT`].
+    Timeout,
+    Other(String),
+}
+
+impl fmt::Display for HttpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("the request timed out"),
+            Self::Other(detail) => write!(f, "the request failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// The one transport operation the install needs. A `reqwest` client implements
+/// it in the daemon, and a test supplies a stub.
+pub trait HttpPost: Send + Sync {
+    fn post<'a>(
+        &'a self,
+        request: PostRequest<'a>,
+    ) -> BoxFuture<'a, Result<HttpResponse, HttpError>>;
+}
+
+/// The app's OAuth client registration, as Linear's application settings show it.
+#[derive(Clone, Debug)]
+pub struct OauthClient {
+    pub client_id: String,
+    /// Linear requires the secret on the token request even for a public client.
+    pub client_secret: Secret,
+    pub redirect_uri: String,
+}
+
+impl OauthClient {
+    /// The URL the operator's browser opens to start an install.
+    #[must_use]
+    pub fn authorize_url(&self, state: StateToken) -> String {
+        AuthorizeRequest {
+            client_id: self.client_id.clone(),
+            redirect_uri: self.redirect_uri.clone(),
+            state,
+            scopes: Scopes::parse(AGENT_SCOPES),
+        }
+        .url(AUTHORIZE_BASE)
+    }
+
+    /// The form body Linear's token endpoint expects for `code`.
+    #[must_use]
+    pub fn token_body(&self, code: &str) -> String {
+        let mut form = Serializer::new(String::new());
+        form.append_pair("code", code);
+        form.append_pair("redirect_uri", &self.redirect_uri);
+        form.append_pair("client_id", &self.client_id);
+        form.append_pair("client_secret", &self.client_secret.0);
+        form.append_pair("grant_type", "authorization_code");
+        form.finish()
+    }
+
+    /// Exchanges `code` for a token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Http`] when the request never answers,
+    /// [`InstallError::Token`] when Linear refuses and says why,
+    /// [`InstallError::TokenStatus`] when it refuses without a readable reason,
+    /// and [`InstallError::Token`] for a 2xx body that is not a usable grant.
+    pub async fn exchange(
+        &self,
+        http: &dyn HttpPost,
+        code: &str,
+    ) -> Result<TokenResponse, InstallError> {
+        let body = self.token_body(code);
+        let response = http
+            .post(PostRequest {
+                url: TOKEN_URL,
+                content_type: FORM_CONTENT_TYPE,
+                authorization: None,
+                body: body.as_bytes(),
+            })
+            .await
+            .map_err(InstallError::Http)?;
+        if !(200..300).contains(&response.status) {
+            // Linear names the reason in the body even on a 4xx, and that reason is
+            // the only thing an operator can act on.
+            return Err(match TokenResponse::parse(&response.body) {
+                Err(error @ TokenError::Rejected { .. }) => InstallError::Token(error),
+                _ => InstallError::TokenStatus(response.status),
+            });
+        }
+        TokenResponse::parse(&response.body).map_err(InstallError::Token)
+    }
+
+    /// Reads the app user id Linear assigned this workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same transport failures as [`Self::exchange`],
+    /// [`InstallError::ViewerStatus`] for a status outside 2xx, and
+    /// [`InstallError::ViewerErrors`] or [`InstallError::ViewerIdMissing`] when
+    /// the answered body carries no id.
+    pub async fn viewer_id(
+        &self,
+        http: &dyn HttpPost,
+        access_token: &str,
+    ) -> Result<String, InstallError> {
+        let authorization = format!("Bearer {access_token}");
+        let response = http
+            .post(PostRequest {
+                url: GRAPHQL_URL,
+                content_type: JSON_CONTENT_TYPE,
+                authorization: Some(&authorization),
+                body: VIEWER_BODY.as_bytes(),
+            })
+            .await
+            .map_err(InstallError::Http)?;
+        if !(200..300).contains(&response.status) {
+            return Err(InstallError::ViewerStatus(response.status));
+        }
+        parse_viewer(&response.body)
+    }
+}
+
+/// Reads `data.viewer.id` out of a GraphQL answer.
+fn parse_viewer(raw: &[u8]) -> Result<String, InstallError> {
+    let body: Value = serde_json::from_slice(raw).map_err(|_| InstallError::ViewerNotJson)?;
+    if let Some(errors) = body.get("errors").and_then(Value::as_array) {
+        let detail = errors
+            .iter()
+            .filter_map(|error| error.get("message").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(InstallError::ViewerErrors(if detail.is_empty() {
+            String::from("the viewer query answered with errors")
+        } else {
+            detail
+        }));
+    }
+    body.get("data")
+        .and_then(|data| data.get("viewer"))
+        .and_then(|viewer| viewer.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or(InstallError::ViewerIdMissing)
+}
+
+/// One workspace installation, ready to persist.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Installation {
+    pub app_user_id: String,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Millis,
+    pub scopes: Scopes,
+    pub installed_at: Millis,
+}
+
+impl fmt::Debug for Installation {
+    // Redacted by hand: a derived `Debug` would print the tokens the moment an
+    // error or a log line touches an installation.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Installation")
+            .field("app_user_id", &self.app_user_id)
+            .field("access_token", &"[redacted]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("scopes", &self.scopes)
+            .field("installed_at", &self.installed_at)
+            .finish()
+    }
+}
+
+/// Runs the whole callback exchange: code to token, then token to app user id.
+///
+/// # Errors
+///
+/// Returns whichever [`InstallError`] stopped it; nothing is returned, so a
+/// caller that only saves on `Ok` never persists a half installation.
+pub async fn complete_install(
+    http: &dyn HttpPost,
+    client: &OauthClient,
+    code: &str,
+    now: Millis,
+) -> Result<Installation, InstallError> {
+    let token = client.exchange(http, code).await?;
+    let app_user_id = client.viewer_id(http, &token.access_token).await?;
+    Ok(Installation {
+        app_user_id,
+        access_token: token.access_token,
+        refresh_token: token.refresh_token,
+        expires_at: expires_at(now, token.expires_in),
+        scopes: token.scopes,
+        installed_at: now,
+    })
+}
+
+/// Why an install did not finish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallError {
+    Http(HttpError),
+    TokenStatus(u16),
+    Token(TokenError),
+    ViewerStatus(u16),
+    ViewerNotJson,
+    ViewerErrors(String),
+    ViewerIdMissing,
+}
+
+impl fmt::Display for InstallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Http(error) => write!(f, "{error}"),
+            Self::TokenStatus(status) => {
+                write!(f, "the token endpoint answered with status {status}")
+            }
+            Self::Token(error) => write!(f, "{error}"),
+            Self::ViewerStatus(status) => {
+                write!(f, "the viewer query answered with status {status}")
+            }
+            Self::ViewerNotJson => {
+                f.write_str("the viewer query answered with a body that is not JSON")
+            }
+            Self::ViewerErrors(detail) => write!(f, "the viewer query failed: {detail}"),
+            Self::ViewerIdMissing => f.write_str("the viewer query returned no viewer id"),
+        }
+    }
+}
+
+impl std::error::Error for InstallError {}
+
+/// The state tokens minted by `/linear/install` and not yet redeemed.
+///
+/// A state lives ten minutes and a restart mid-install is a failed install the
+/// operator retries, so this lives in memory rather than in a table.
+#[derive(Debug, Default)]
+pub struct StateStore {
+    states: Mutex<Vec<StateToken>>,
+}
+
+impl StateStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds `token`, dropping every entry already expired at `now` so the set
+    /// cannot grow with retries nobody completes.
+    pub fn insert(&self, token: StateToken, now: Millis) {
+        let mut states = self.lock();
+        states.retain(|state| state.is_live(now));
+        states.push(token);
+    }
+
+    /// Redeems `candidate` at most once, reporting whether it was live.
+    ///
+    /// The removal and the comparison happen under one lock, so two callbacks
+    /// presenting the same state cannot both succeed.
+    pub fn consume(&self, candidate: &str, now: Millis) -> bool {
+        let mut states = self.lock();
+        states.retain(|state| state.is_live(now));
+        let Some(index) = states.iter().position(|state| state.matches(candidate)) else {
+            return false;
+        };
+        states.remove(index);
+        true
+    }
+
+    /// Recovering a poisoned lock is right here: a panic elsewhere must not wedge
+    /// every future install, and these tokens are worth nothing after ten minutes.
+    fn lock(&self) -> MutexGuard<'_, Vec<StateToken>> {
+        self.states.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// One scope Linear grants an agent app.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
