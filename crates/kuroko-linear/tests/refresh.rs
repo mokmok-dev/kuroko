@@ -179,6 +179,14 @@ async fn a_2xx_body_without_a_token_is_transient() {
     assert!(matches!(error, RefreshError::Transient(_)), "{error:?}");
 }
 
+#[tokio::test]
+async fn a_refused_status_wins_over_a_body_that_looks_like_a_grant() {
+    let http = Stub::answering(vec![Ok(answered(500, REFRESHED))]);
+    let error = client().refresh(&http, REFRESH_TOKEN).await.unwrap_err();
+
+    assert!(matches!(error, RefreshError::Transient(_)), "{error:?}");
+}
+
 #[test]
 fn a_renewed_pair_takes_the_new_tokens_and_the_new_expiry() {
     let token = TokenResponse::parse(REFRESHED.as_bytes()).unwrap();
