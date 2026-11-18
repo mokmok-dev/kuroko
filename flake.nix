@@ -172,12 +172,112 @@
                     ];
                   }).config.services.kuroko.package;
 
+                # A second stub with the OAuth settings, so the check proves the
+                # rendered table and the credential loading rather than the path
+                # without them.
+                oauthStub = nixosSystem {
+                  inherit system;
+                  modules = [
+                    kurokoModule
+                    {
+                      system.stateVersion = "24.11";
+                      services.kuroko = {
+                        enable = true;
+                        package = pkgs.writeShellScriptBin "kuroko" "exec true";
+                        settings = {
+                          linear.secret = "whsec_test";
+                          # Written here on purpose: the module must replace this
+                          # table rather than publish it, and the secret below must
+                          # not reach the rendered config.
+                          linear.oauth = {
+                            client_secret = "client-secret-in-settings";
+                            install_secret = "install-secret-in-settings";
+                          };
+                          transport.stdio.command = "cat";
+                        };
+                        oauth = {
+                          clientId = "client-id-from-linear";
+                          redirectUri = "https://kuroko.example/linear/oauth/callback";
+                          installSecretFile = "/run/secrets/kuroko-install-secret";
+                          clientSecretFile = "/run/secrets/kuroko-client-secret";
+                        };
+                      };
+                    }
+                  ];
+                };
+
+                # Only the assertions are read, so this needs no root filesystem.
+                partialMessage =
+                  let
+                    failures =
+                      builtins.filter (entry: !entry.assertion)
+                        (nixosSystem {
+                          inherit system;
+                          modules = [
+                            kurokoModule
+                            {
+                              system.stateVersion = "24.11";
+                              services.kuroko = {
+                                enable = true;
+                                package = pkgs.writeShellScriptBin "kuroko" "exec true";
+                                settings = {
+                                  linear.secret = "whsec_test";
+                                  transport.stdio.command = "cat";
+                                };
+                                oauth.clientId = "client-id-from-linear";
+                              };
+                            }
+                          ];
+                        }).config.assertions;
+                  in
+                  builtins.concatStringsSep "\n" (map (entry: entry.message) failures);
+
                 unit = stub.config.systemd.units."kuroko.service".text;
                 generated = stub.config.environment.etc."kuroko/config.toml".source;
+                oauthUnit = oauthStub.config.systemd.units."kuroko.service".text;
+                oauthGenerated = oauthStub.config.environment.etc."kuroko/config.toml".source;
                 unitFile = pkgs.writeText "kuroko.service" unit;
+                oauthUnitFile = pkgs.writeText "kuroko-oauth.service" oauthUnit;
+                partialFile = pkgs.writeText "kuroko-partial-assertion" partialMessage;
+
+                # The path an existing operator is on: no oauth options at all.
+                # Its assertions must all hold, which the module check cannot prove
+                # by rendering the config alone, because a failed assertion is
+                # raised at `system.build.toplevel` and not at the etc file.
+                unsetAssertions =
+                  builtins.filter (entry: !entry.assertion)
+                    (nixosSystem {
+                      inherit system;
+                      modules = [
+                        kurokoModule
+                        {
+                          system.stateVersion = "24.11";
+                          services.kuroko = {
+                            enable = true;
+                            package = pkgs.writeShellScriptBin "kuroko" "exec true";
+                            settings = {
+                              linear.secret = "whsec_test";
+                              transport.stdio.command = "cat";
+                            };
+                          };
+                        }
+                      ];
+                    }).config.assertions;
+                unsetFile = pkgs.writeText "kuroko-unset-assertions" (
+                  builtins.concatStringsSep "\n" (map (entry: entry.message) unsetAssertions)
+                );
               in
               assert defaultPackage.meta.mainProgram == "kuroko";
               pkgs.runCommand "kuroko-module-check" { } ''
+                # `! grep` cannot fail under `set -e`, so an absent match needs an
+                # explicit exit or the assertion silently passes.
+                absent() {
+                  if grep -q -- "$2" "$1"; then
+                    echo "unexpected '$2' in $1" >&2
+                    exit 1
+                  fi
+                }
+
                 grep -q -- '--config /etc/kuroko/config.toml' ${unitFile}
                 grep -q -- 'User=kuroko' ${unitFile}
                 grep -q -- 'StateDirectory=kuroko' ${unitFile}
@@ -192,6 +292,38 @@
                 grep -q -- 'bind = "127.0.0.1:8787"' ${generated}
                 grep -q -- 'command = "cat"' ${generated}
                 grep -q -- 'agent' ${generated}
+
+                # An unset OAuth must leave the unit and the config as they were.
+                absent ${unitFile} 'LoadCredential'
+                absent ${unitFile} '_SECRET_FILE'
+                absent ${generated} 'linear.oauth'
+
+                # The OAuth settings add the non-secret table and the two secrets.
+                grep -q -- '^\[linear.oauth\]' ${oauthGenerated}
+                grep -q -- 'client_id = "client-id-from-linear"' ${oauthGenerated}
+                grep -q -- 'redirect_uri = "https://kuroko.example/linear/oauth/callback"' ${oauthGenerated}
+                grep -q -- 'LoadCredential=client_secret:/run/secrets/kuroko-client-secret' ${oauthUnitFile}
+                grep -q -- 'LoadCredential=install_secret:/run/secrets/kuroko-install-secret' ${oauthUnitFile}
+                grep -q -- 'KUROKO_LINEAR_CLIENT_SECRET_FILE=%d/client_secret' ${oauthUnitFile}
+                grep -q -- 'KUROKO_LINEAR_INSTALL_SECRET_FILE=%d/install_secret' ${oauthUnitFile}
+
+                # Neither secret value may reach the world-readable config, and the
+                # secret keys written into `settings.linear.oauth` must be dropped.
+                absent ${oauthGenerated} 'client-secret-in-settings'
+                absent ${oauthGenerated} 'install-secret-in-settings'
+                absent ${oauthGenerated} 'client_secret'
+                absent ${oauthGenerated} 'install_secret'
+
+                # A partial oauth block fails evaluation and names what is missing.
+                grep -q -- 'services.kuroko.oauth.clientSecretFile' ${partialFile}
+                grep -q -- 'services.kuroko.oauth.installSecretFile' ${partialFile}
+                grep -q -- 'services.kuroko.oauth.redirectUri' ${partialFile}
+                absent ${partialFile} 'services.kuroko.oauth.clientId'
+
+                # An unset oauth block must satisfy every assertion, so no message
+                # mentions `services.kuroko.oauth`. A module that rejected the
+                # no-oauth case would break every existing operator.
+                absent ${unsetFile} 'services.kuroko.oauth'
 
                 touch $out
               '';
