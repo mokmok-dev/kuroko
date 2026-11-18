@@ -5,7 +5,7 @@
 //! this module owns the lock, the HTTP call, and the store around that decision.
 
 use std::fmt;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use kuroko_core::Clock;
 use kuroko_linear::oauth::{HttpPost, Installation, OauthClient, RefreshError};
@@ -17,13 +17,13 @@ use crate::router::Installations;
 /// Holds the installation and produces a live access token from it.
 pub struct TokenProvider {
     client: OauthClient,
-    http: std::sync::Arc<dyn HttpPost>,
-    store: std::sync::Arc<dyn Installations>,
-    clock: std::sync::Arc<dyn Clock>,
+    http: Arc<dyn HttpPost>,
+    store: Arc<dyn Installations>,
+    clock: Arc<dyn Clock>,
     slot: Mutex<Slot>,
-    /// Bumped after every settled transition. A caller that arrives mid-exchange
-    /// waits here instead of subscribing to the slot, because a `watch` compares
-    /// versions and so cannot miss a change made between its check and its wait.
+    /// Bumped after every transition settles. Waiters park here rather than on
+    /// the slot itself, so a change made between a caller's check and its wait
+    /// is still delivered.
     changes: watch::Sender<u64>,
 }
 
@@ -31,9 +31,9 @@ impl TokenProvider {
     #[must_use]
     pub fn new(
         client: OauthClient,
-        http: std::sync::Arc<dyn HttpPost>,
-        store: std::sync::Arc<dyn Installations>,
-        clock: std::sync::Arc<dyn Clock>,
+        http: Arc<dyn HttpPost>,
+        store: Arc<dyn Installations>,
+        clock: Arc<dyn Clock>,
         installation: Option<Installation>,
     ) -> Self {
         Self {
@@ -101,9 +101,9 @@ impl TokenProvider {
                 // Persisted before it is returned: Linear already rotated the
                 // refresh token, so a crash now would lose the only usable pair.
                 if let Err(error) = self.store.save(&renewed) {
-                    // The stored row still holds a spent refresh token, so keeping
-                    // the claimed pair is the only state the next attempt can
-                    // discover the truth from.
+                    // Keeping the claimed pair is deliberate. The stored row now
+                    // holds a refresh token Linear has already spent, so a restart
+                    // discovers that rather than trusting a pair that cannot work.
                     return Err(TokenFailure::NotSaved(error));
                 }
                 claim.commit(renewed.clone());
