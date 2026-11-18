@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kuroko_core::{DelegateId, LabelName, Limits, Millis};
+use kuroko_linear::oauth::{OauthClient, Secret};
 use kuroko_linear::{PromptTemplate, TriggerConfig, WebhookSecret};
 use serde::Deserialize;
 
@@ -14,6 +15,9 @@ pub const DEFAULT_PATH: &str = "kuroko.toml";
 
 /// Overrides `[linear] secret` when it is set to a non-empty value.
 pub const SECRET_ENV: &str = "KUROKO_LINEAR_SECRET";
+
+/// Overrides `[linear.oauth] client_secret` when it is set to a non-empty value.
+pub const CLIENT_SECRET_ENV: &str = "KUROKO_LINEAR_CLIENT_SECRET";
 
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_STORE_PATH: &str = "kuroko.db";
@@ -28,12 +32,27 @@ const DEFAULT_MAX_QUEUED: usize = 64;
 pub struct Config {
     pub bind: SocketAddr,
     pub secret: WebhookSecret,
+    /// Absent when the operator has not registered an OAuth app yet. Webhooks
+    /// work without it; only the install routes then answer `404`.
+    pub oauth: Option<OauthConfig>,
     pub replay_window: Millis,
     pub triggers: TriggerConfig,
     pub template: PromptTemplate,
     pub limits: Limits,
     pub transport: TransportChoice,
     pub store: PathBuf,
+}
+
+/// The OAuth app registration and the secret that guards the install route.
+///
+/// `client_secret` and `install_secret` are [`Secret`], which renders as
+/// `[redacted]`, so neither reaches a log line or a rendered config. Feed them
+/// from `KUROKO_LINEAR_CLIENT_SECRET` or a systemd `LoadCredential` file rather
+/// than the TOML, which the NixOS module writes to the world-readable store.
+#[derive(Clone, Debug)]
+pub struct OauthConfig {
+    pub client: OauthClient,
+    pub install_secret: Secret,
 }
 
 /// The one transport the operator configured.
@@ -85,8 +104,7 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        let secret = std::env::var(SECRET_ENV).ok();
-        let mut config = Self::from_toml(&text, secret.as_deref())?;
+        let mut config = Self::from_toml(&text, &EnvOverrides::from_environment())?;
         // A relative store path belongs beside the config, so a launch from another
         // working directory does not scatter the database and its WAL files.
         if config.store.is_relative()
@@ -97,14 +115,31 @@ impl Config {
         Ok(config)
     }
 
-    /// Parses `text` and applies `secret_override` over `[linear] secret`.
+    /// Parses `text`, letting `env` override the two secrets.
     ///
     /// # Errors
     ///
     /// Returns [`BootError`] when the text does not parse as TOML or fails validation.
-    pub fn from_toml(text: &str, secret_override: Option<&str>) -> Result<Self, BootError> {
+    pub fn from_toml(text: &str, env: &EnvOverrides) -> Result<Self, BootError> {
         let raw: RawConfig = toml::from_str(text).map_err(BootError::Toml)?;
-        raw.resolve(secret_override)
+        raw.resolve(env)
+    }
+}
+
+/// The environment values a test can inject instead of mutating the process.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnvOverrides {
+    pub webhook_secret: Option<String>,
+    pub client_secret: Option<String>,
+}
+
+impl EnvOverrides {
+    #[must_use]
+    pub fn from_environment() -> Self {
+        Self {
+            webhook_secret: std::env::var(SECRET_ENV).ok(),
+            client_secret: std::env::var(CLIENT_SECRET_ENV).ok(),
+        }
     }
 }
 
@@ -138,6 +173,19 @@ struct ServerSection {
 struct LinearSection {
     secret: Option<String>,
     replay_window_secs: Option<i64>,
+    #[serde(default)]
+    oauth: Option<OauthSection>,
+}
+
+/// Read as `Option` fields so a partial table reports every missing key at once
+/// instead of stopping at the first one serde requires.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OauthSection {
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    redirect_uri: Option<String>,
+    install_secret: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -176,6 +224,24 @@ struct RawTransport {
     websocket: Option<WebSocketSection>,
 }
 
+impl RawTransport {
+    /// Resolves the one transport the operator configured.
+    fn resolve(self) -> Result<TransportChoice, BootError> {
+        match (self.stdio, self.websocket) {
+            (Some(stdio), None) => stdio.resolve(),
+            (None, Some(websocket)) => websocket.resolve(),
+            (None, None) => Err(invalid(
+                "configure exactly one of `[transport.stdio]` or `[transport.websocket]`: neither is set"
+                    .to_owned(),
+            )),
+            (Some(_), Some(_)) => Err(invalid(
+                "configure exactly one of `[transport.stdio]` or `[transport.websocket]`: both are set"
+                    .to_owned(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StdioSection {
@@ -193,7 +259,7 @@ struct WebSocketSection {
 }
 
 impl RawConfig {
-    fn resolve(self, secret_override: Option<&str>) -> Result<Config, BootError> {
+    fn resolve(self, env: &EnvOverrides) -> Result<Config, BootError> {
         let Self {
             server,
             linear,
@@ -204,7 +270,9 @@ impl RawConfig {
             transport,
         } = self;
 
-        let secret = secret_override
+        let secret = env
+            .webhook_secret
+            .as_deref()
             .filter(|value| !value.is_empty())
             .or(linear.secret.as_deref())
             .filter(|value| !value.is_empty())
@@ -214,6 +282,8 @@ impl RawConfig {
                     "set `[linear] secret` in the config or {SECRET_ENV} in the environment"
                 ))
             })?;
+
+        let oauth = linear.oauth.map(|oauth| oauth.resolve(env)).transpose()?;
 
         let bind_text = server.bind.as_deref().unwrap_or(DEFAULT_BIND);
         let bind = bind_text
@@ -240,22 +310,7 @@ impl RawConfig {
             )?,
         };
 
-        let transport = match (transport.stdio, transport.websocket) {
-            (Some(stdio), None) => stdio.resolve()?,
-            (None, Some(websocket)) => websocket.resolve()?,
-            (None, None) => {
-                return Err(invalid(
-                    "configure exactly one of `[transport.stdio]` or `[transport.websocket]`: neither is set"
-                        .to_owned(),
-                ));
-            }
-            (Some(_), Some(_)) => {
-                return Err(invalid(
-                    "configure exactly one of `[transport.stdio]` or `[transport.websocket]`: both are set"
-                        .to_owned(),
-                ));
-            }
-        };
+        let transport = transport.resolve()?;
 
         if trigger.delegate_ids.iter().any(String::is_empty) {
             return Err(invalid(
@@ -276,6 +331,7 @@ impl RawConfig {
         Ok(Config {
             bind,
             secret,
+            oauth,
             replay_window: Millis(window_secs.saturating_mul(1000)),
             triggers: TriggerConfig {
                 any_delegate: trigger.any_delegate.unwrap_or(true),
@@ -298,6 +354,64 @@ impl RawConfig {
             limits,
             transport,
             store: PathBuf::from(store_text),
+        })
+    }
+}
+
+impl OauthSection {
+    /// Builds the OAuth config, or names every key the table is missing.
+    fn resolve(self, env: &EnvOverrides) -> Result<OauthConfig, BootError> {
+        let Self {
+            client_id,
+            client_secret,
+            redirect_uri,
+            install_secret,
+        } = self;
+
+        let client_secret = env
+            .client_secret
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or(client_secret);
+        let keys = [
+            ("client_id", client_id.as_deref()),
+            ("client_secret", client_secret.as_deref()),
+            ("redirect_uri", redirect_uri.as_deref()),
+            ("install_secret", install_secret.as_deref()),
+        ];
+        let missing = keys
+            .iter()
+            .filter(|(_, value)| value.is_none_or(str::is_empty))
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(invalid(format!(
+                "`[linear.oauth]` sets client_id, client_secret, redirect_uri, and install_secret together, or not at all; missing {}",
+                missing.join(", ")
+            )));
+        }
+
+        let (Some(client_id), Some(client_secret), Some(redirect_uri), Some(install_secret)) =
+            (client_id, client_secret, redirect_uri, install_secret)
+        else {
+            return Err(invalid(
+                "`[linear.oauth]` must set all four keys or none".to_owned(),
+            ));
+        };
+        if !(redirect_uri.starts_with("https://") || redirect_uri.starts_with("http://")) {
+            return Err(invalid(format!(
+                "`[linear.oauth] redirect_uri` `{redirect_uri}` must start with http:// or https://"
+            )));
+        }
+
+        Ok(OauthConfig {
+            client: OauthClient {
+                client_id,
+                client_secret: Secret::new(client_secret),
+                redirect_uri,
+            },
+            install_secret: Secret::new(install_secret),
         })
     }
 }
