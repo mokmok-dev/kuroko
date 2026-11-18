@@ -14,10 +14,24 @@ let
 
   # The operator's table wins leaf by leaf, so overriding `store` with only a
   # `path` keeps the rest of the rendered defaults.
-  settings = lib.recursiveUpdate {
+  baseSettings = lib.recursiveUpdate {
     server.bind = "127.0.0.1:8787";
     store.path = "/var/lib/${cfg.stateDirectory}/kuroko.db";
   } cfg.settings;
+
+  # Only the non-secret keys reach the rendered table. `//` replaces the whole
+  # `oauth` value, so a `client_secret` or `install_secret` written into
+  # `settings.linear.oauth` is dropped rather than published in the store.
+  settings =
+    baseSettings
+    // lib.optionalAttrs oauthConfigured {
+      linear = (baseSettings.linear or { }) // {
+        oauth = {
+          client_id = cfg.oauth.clientId;
+          redirect_uri = cfg.oauth.redirectUri;
+        };
+      };
+    };
 
   transports = builtins.filter (name: settings.transport ? ${name}) [
     "stdio"
@@ -28,6 +42,35 @@ let
     if cfg.workingDirectory != null then cfg.workingDirectory else "/var/lib/${cfg.stateDirectory}";
 
   secretInSettings = cfg.settings ? linear && cfg.settings.linear ? secret;
+
+  # Spelled out rather than derived, so the assertion message names the option
+  # the operator has to set.
+  oauthKeys = {
+    inherit (cfg.oauth)
+      clientId
+      redirectUri
+      installSecretFile
+      clientSecretFile
+      ;
+  };
+
+  missingOauthKeys = builtins.attrNames (lib.filterAttrs (_name: value: value == null) oauthKeys);
+
+  oauthConfigured = missingOauthKeys == [ ];
+
+  oauthTableInSettings = cfg.settings ? linear && cfg.settings.linear ? oauth;
+
+  credentials = lib.optionalAttrs oauthConfigured {
+    LoadCredential = [
+      "client_secret:${toString cfg.oauth.clientSecretFile}"
+      "install_secret:${toString cfg.oauth.installSecretFile}"
+    ];
+  };
+
+  credentialEnvironment = lib.optionalAttrs oauthConfigured {
+    KUROKO_LINEAR_CLIENT_SECRET_FILE = "%d/client_secret";
+    KUROKO_LINEAR_INSTALL_SECRET_FILE = "%d/install_secret";
+  };
 in
 {
   options.services.kuroko = {
@@ -55,6 +98,55 @@ in
         Environment file read by systemd. Put `KUROKO_LINEAR_SECRET=...` here so the
         webhook secret stays out of the Nix store.
       '';
+    };
+
+    oauth = {
+      clientId = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "0a1b2c3d4e5f";
+        description = ''
+          The OAuth application's client ID, from Linear's application settings.
+          The four `oauth` options are set together or not at all; leaving them
+          unset keeps the webhook path working and answers both install routes
+          with `404`.
+        '';
+      };
+
+      redirectUri = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "https://kuroko.example/linear/oauth/callback";
+        description = ''
+          The callback URL registered on the application. It must reach this
+          daemon's `/linear/oauth/callback` route.
+        '';
+      };
+
+      installSecretFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = ''
+          File holding the secret that guards `GET /linear/install`. The module
+          passes it through systemd's `LoadCredential` and sets
+          `KUROKO_LINEAR_INSTALL_SECRET_FILE` to the credential path, so the value
+          never reaches the Nix store or the rendered config. The file is read at
+          every start, so restart the unit after you change it.
+        '';
+      };
+
+      clientSecretFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = ''
+          File holding the OAuth application's client secret. The module passes it
+          through systemd's `LoadCredential` and sets
+          `KUROKO_LINEAR_CLIENT_SECRET_FILE` to the credential path, which this
+          takes over from a `KUROKO_LINEAR_CLIENT_SECRET` value in
+          `environmentFile`. The file is read at every start, so restart the unit
+          after you change it.
+        '';
+      };
     };
 
     user = lib.mkOption {
@@ -132,12 +224,25 @@ in
           "services.kuroko.settings.store.path must be absolute; "
           + "a relative path resolves beside /etc/kuroko/config.toml";
       }
+      {
+        assertion = oauthConfigured;
+        message =
+          "services.kuroko.oauth is set partly; missing "
+          + lib.concatMapStringsSep ", " (key: "services.kuroko.oauth.${key}") missingOauthKeys
+          + ". Set all four oauth options, or none of them.";
+      }
     ];
 
-    warnings = lib.optional secretInSettings ''
-      services.kuroko.settings.linear.secret writes the webhook secret to the
-      world-readable Nix store. Set services.kuroko.environmentFile instead.
-    '';
+    warnings =
+      lib.optional secretInSettings ''
+        services.kuroko.settings.linear.secret writes the webhook secret to the
+        world-readable Nix store. Set services.kuroko.environmentFile instead.
+      ''
+      ++ lib.optional (oauthConfigured && oauthTableInSettings) ''
+        services.kuroko.settings.linear.oauth is ignored because
+        services.kuroko.oauth renders that table. A secret written there would
+        reach the world-readable Nix store.
+      '';
 
     users.groups.${cfg.group} = { };
 
@@ -159,7 +264,9 @@ in
       # only a setting changes; restart on the file the daemon actually reads.
       restartTriggers = [ config.environment.etc."kuroko/config.toml".source ];
 
-      environment.RUST_LOG = cfg.logLevel;
+      environment = credentialEnvironment // {
+        RUST_LOG = cfg.logLevel;
+      };
 
       serviceConfig = lib.mkMerge [
         {
@@ -180,6 +287,7 @@ in
         (lib.mkIf (cfg.environmentFile != null) {
           EnvironmentFile = cfg.environmentFile;
         })
+        credentials
         cfg.extraServiceConfig
       ];
     };
