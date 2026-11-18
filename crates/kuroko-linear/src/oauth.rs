@@ -237,6 +237,7 @@ impl OauthClient {
             .map_err(|error| RefreshError::Transient(error.to_string()))?;
         let refused = !(200..300).contains(&response.status);
         match TokenResponse::parse(&response.body) {
+            // A refused status wins over a body that happens to parse as a grant.
             Ok(token) if !refused => Ok(token),
             Ok(_) => Err(RefreshError::Transient(format!(
                 "the token endpoint answered with status {}",
@@ -247,11 +248,10 @@ impl OauthClient {
             Err(TokenError::Rejected { error, .. }) if error == INVALID_GRANT => {
                 Err(RefreshError::Revoked)
             }
-            Err(error) if refused => Err(RefreshError::Transient(format!(
+            Err(error) => Err(RefreshError::Transient(format!(
                 "the token endpoint answered with status {}: {error}",
                 response.status
             ))),
-            Err(error) => Err(RefreshError::Transient(error.to_string())),
         }
     }
 
