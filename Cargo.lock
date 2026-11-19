@@ -952,7 +952,7 @@ dependencies = [
 name = "kuroko-linear"
 version = "2026.11.1"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "form_urlencoded",
  "hex",
  "hmac",
